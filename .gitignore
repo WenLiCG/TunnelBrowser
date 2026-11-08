@@ -1,0 +1,6 @@
+/build/
+/dist/
+/downloads/
+/third_party/
+__pycache__/
+*.user

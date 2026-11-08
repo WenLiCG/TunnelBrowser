@@ -1,8 +1,8 @@
 # Tunnel Browser 0.2
 
-最新交接见 [Tunnel Browser 0.2.0 开发交接](HANDOFF.md)。文中的构建与验证命令在完整项目源码目录运行。
-
 Windows x64 浏览器，采用 CEF 150 的原生 Chromium 多标签界面和进程内 libXray 26.10.31。正常使用不需要管理员、系统代理或虚拟网卡。
+
+从 [GitHub Releases](https://github.com/WenLiCG/TunnelBrowser/releases/tag/v0.2.0) 下载 Windows x64 ZIP 和 SHA-256 校验文件。开发环境和验收记录见 [开发交接](https://github.com/WenLiCG/TunnelBrowser/blob/main/HANDOFF.md)。
 
 ## 日常浏览
 

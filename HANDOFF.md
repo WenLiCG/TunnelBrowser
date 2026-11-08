@@ -4,9 +4,9 @@
 
 ## 接手需要哪些文件
 
-- 本次核对时，Git 仓库尚无提交或远程地址。交接源码时，以当前工作区为准，带上根目录的 `.gitignore`、`CMakeLists.txt`、Markdown 文档以及 `src/`、`tools/`、`tests/`、`research/`。接手人应先将这份源码建立为版本基线，再开始改动。
+- 从 [GitHub 仓库](https://github.com/WenLiCG/TunnelBrowser) 克隆源码，使用 `v0.2.0` 标签复现当前公开版本。
 - `build/`、`downloads/`、`third_party/`、`dist/` 都是忽略目录。前三者分别是构建输出、下载和本机工具缓存、已解包依赖，换机器可以重新生成。
-- 现有运行包是 `dist/TunnelBrowser-Windows-x64-0.2.0.zip`，SHA-256 为 `3dbaaa2a4ffc63624989dfac1ce7e787f810b1c22e1ebf0b06532203c836ace3`。解压完整目录后运行 `TunnelBrowser.exe`。包尚未签名。
+- 从 [v0.2.0 Release](https://github.com/WenLiCG/TunnelBrowser/releases/tag/v0.2.0) 下载 Windows x64 ZIP 和配套的 `.sha256` 校验文件。解压完整目录后运行 `TunnelBrowser.exe`。包尚未签名。
 - 用户数据在 `%LOCALAPPDATA%\TunnelBrowser`，与源码、二进制交接分开。普通故障报告提供脱敏的错误分类、发生阶段、版本和复现步骤即可。完整节点链接、生成的 Xray JSON 和用户 profile 都可能含敏感信息。
 
 ## 本地构建和验证
@@ -28,20 +28,21 @@ python .\tests\local_reality.py
 
 # 验收通过后，生成 ZIP 和 SHA-256 文件
 python .\tools\package.py
+python .\tests\package_check.py
 ```
 
-- `tools/fetch-deps.py` 固定并校验 CEF `150.0.23+g4ccc4ca+chromium-150.0.7871.287` 和 libXray `v26.10.31` 的 Windows x64 归档。首次构建需访问 CEF 下载站、GitHub Release 和许可证文件地址。
-- `CMakeLists.txt` 生成 `build/app/TunnelBrowser.dll`，复制 CEF 运行库和资源，并把官方沙箱启动器复制为 `TunnelBrowser.exe`。自检通过原名 `bootstrapc.exe` 加 `--module=TunnelBrowser` 调用客户端 DLL。
-- `tests/local_reality.py` 启动回环 HTTP fixture 和 REALITY/Vision 服务端，用临时节点和独立数据目录运行三次浏览器。预期输出 `PASS: proxy`、两次 `PASS: direct` 和总结。失败时优先看 `%TEMP%\tunnel-browser-test-*` 中本次运行目录的 `result.json`（若已生成）、`environments.json` 和两侧日志。测试生成的 fixture 也包含临时节点信息。
-- `tools/package.py` 从 `build/app` 组装目录并压缩，包含运行资源和第三方许可证。它会复用现有 `dist/TunnelBrowser/`。升级依赖或删除运行文件后，先用干净的输出目录出包，避免把上版遗留文件带进去。更改发布版本时同步更新脚本内的 ZIP 名和 README。
+- [fetch-deps.py](tools/fetch-deps.py) 固定并校验 CEF `150.0.23+g4ccc4ca+chromium-150.0.7871.287` 和 libXray `v26.10.31` 的 Windows x64 归档。首次构建需访问 CEF 下载站、GitHub Release 和许可证文件地址。
+- [CMakeLists.txt](CMakeLists.txt) 生成 `build/app/TunnelBrowser.dll`，复制 CEF 运行库和资源，并把官方沙箱启动器复制为 `TunnelBrowser.exe`。自检通过原名 `bootstrapc.exe` 加 `--module=TunnelBrowser` 调用客户端 DLL。
+- [local_reality.py](tests/local_reality.py) 启动回环 HTTP fixture 和 REALITY/Vision 服务端，用临时节点和独立数据目录运行三次浏览器。预期输出 `PASS: proxy`、两次 `PASS: direct` 和总结。失败时优先看 `%TEMP%\tunnel-browser-test-*` 中本次运行目录的 `result.json`（若已生成）、`environments.json` 和两侧日志。测试生成的 fixture 也包含临时节点信息。
+- [package.py](tools/package.py) 将应用运行文件、CEF 资源和第三方许可证直接写入 ZIP。[包检查](tests/package_check.py) 验证 ZIP 和 SHA-256，检查运行文件、日志及应用 DLL 的本机路径。更改发布版本时同步更新脚本内的 ZIP 名和 README。
 
 ## 源码入口和必须保持的行为
 
 | 改动范围 | 从哪里读 |
 | --- | --- |
-| 进程生命周期、原生多标签、设置入口 | `src/app.cc` 的 `Run`、`App`、`BrowserClient`、`PanelProc` |
-| 节点导入、代理启停、切换时的网络控制 | `src/node.cc` 的 `ParseNode`、`MakeConfig`，以及 `app.cc` 的 `Core`、`BeginConnect`、`Disconnect`、`FinishSwitch`、`ProxyPolicy`、`Traffic` |
-| 持久化、清空 profile、环境参数 | `src/profile.cc` 的 `LoadProfile`、`SaveProfile`、`ResetProfileData`，以及 `BrowserClient::OnAfterCreated`、`OnDevToolsMethodResult` |
+| 进程生命周期、原生多标签、设置入口 | [src/app.cc](src/app.cc) 的 `Run`、`App`、`BrowserClient`、`PanelProc` |
+| 节点导入、代理启停、切换时的网络控制 | [src/node.cc](src/node.cc) 的 `ParseNode`、`MakeConfig`，以及 `app.cc` 的 `Core`、`BeginConnect`、`Disconnect`、`FinishSwitch`、`ProxyPolicy`、`Traffic` |
+| 持久化、清空 profile、环境参数 | [src/profile.cc](src/profile.cc) 的 `LoadProfile`、`SaveProfile`、`ResetProfileData`，以及 `BrowserClient::OnAfterCreated`、`OnDevToolsMethodResult` |
 
 ### 网络和代理
 
@@ -66,6 +67,6 @@ python .\tools\package.py
 
 - 0.2 发布时通过 21 项原生自检。回环集成通过完整 REALITY/Vision 请求链路，并从服务端访问日志确认流量实际经过代理。覆盖了核心故障时请求失败、主动关闭后恢复直连、原生新标签、黄绿状态、页面和同源 iframe 环境参数，以及重启后 Cookie 和 localStorage 持久化。出包时检查了 ZIP 完整性、运行库哈希和 `xray.exe` 缺席。
 - 2026-11-08 交接时，用现有构建重跑了 21 项自检及三个集成场景，均通过。回环 HTTP fixture 记录了一次 `WinError 10053`（连接被中止），测试最终退出码为 0。重新计算的 ZIP 哈希与发布记录一致。
-- 首次接手后建议先建立源码基线并跑上述自检和集成，再用获授权的真实节点验收。优先检查断网与恢复、节点切换和退出，同时分别验证 DNS、IPv6、WebRTC、WebSocket 和下载行为。回环结果只覆盖 fixture；真实节点、完整旁路审计、长期稳定性和完整视觉验收尚未完成。
+- 首次接手后建议先运行上述自检和集成，再用获授权的真实节点验收。优先检查断网与恢复、节点切换和退出，同时分别验证 DNS、IPv6、WebRTC、WebSocket 和下载行为。回环结果只覆盖 fixture；真实节点、完整旁路审计、长期稳定性和完整视觉验收尚未完成。
 - 用户本阶段选择先做浏览体验和环境参数。Canvas、WebGL、音频和字体属于后续工作，Worker 和跨进程 iframe 的环境覆盖仍需测试。内部 profile ID 的轮换与网页可见的硬件指纹无关。
 - 升级时核对 [THIRD_PARTY.md](THIRD_PARTY.md) 的上游版本和许可。CEF 版本同时在 CMake 和下载脚本固定。libXray 升级要重新验证 C ABI、版本自检、配置 schema 与核心启停，并重跑回环集成。早期 [Xray 调研](research/xray-integration-evidence.md) 可用于追溯设计和上游实现，其中的“未构建”描述的是调研阶段。
