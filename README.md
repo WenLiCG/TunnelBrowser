@@ -34,6 +34,22 @@ Windows x64 浏览器，采用 CEF 150 的原生 Chromium 多标签界面和进�
 
 ## 构建与验证
 
+旧基线 `ebad1c85` 在干净 PowerShell 5.1 下用 ComSpec 引号拼接导入 vcvars；VS 路径含空格时，cmd 把命令解析为 `'""C:\Program'`，报“不是内部或外部命令”，随后 CMake 找不到编译器。已预载工具链的成功构建不能证明该基线可在干净 PowerShell 5.1 直接复现。
+
+修复前可在 cmd 中先 `call "<VS安装目录>\VC\Auxiliary\Build\vcvars64.bat"`，再从同一 cmd 启动 PowerShell 运行构建；或从“x64 Native Tools Command Prompt”运行 `tools\build.ps1`。已有 `cl.exe` 在 PATH 时会跳过导入。
+
+本次修复用临时 `.cmd` 调用 vcvars 后执行 `set`，导入当前进程环境，用完删除临时文件。修复后干净 PowerShell 5.1 可直接运行下列命令，完整构建待 Windows 测试机验收：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build.ps1
+```
+
+聚焦导入测试无需下载依赖，在 Windows PowerShell 5.1 运行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\test_vcvars_import.ps1
+```
+
 需要 Python 3.11+、Visual Studio 2022 C++ x64 构建工具和 Windows SDK、CMake 3.21+、Ninja。
 
 ```powershell
