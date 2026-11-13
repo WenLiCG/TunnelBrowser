@@ -15,8 +15,28 @@ if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
         }
     }
     if (-not (Test-Path -LiteralPath $taskSetup)) { throw 'Install Visual Studio 2022 C++ Build Tools and the Windows SDK, or run from an x64 Native Tools prompt.' }
-    & $env:ComSpec /d /s /c ('""{0}" >nul && set"' -f $taskSetup) | ForEach-Object {
-        if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') }
+    # Pass a simple filename to cmd, avoiding PS 5.1 native argument quoting.
+    $taskCmd = Join-Path ([IO.Path]::GetTempPath()) ('tb-vcvars-' + [guid]::NewGuid() + '.cmd')
+    try {
+        [IO.File]::WriteAllLines($taskCmd, @(
+            '@echo off',
+            ('call "{0}" >nul' -f $taskSetup),
+            'if errorlevel 1 exit /b %errorlevel%',
+            'set'
+        ), [Text.Encoding]::Default)
+        Push-Location -LiteralPath (Split-Path -Parent $taskCmd)
+        try {
+            $taskEnvironment = & $env:ComSpec /d /c (Split-Path -Leaf $taskCmd)
+            $taskImportExitCode = $LASTEXITCODE
+        } finally {
+            Pop-Location
+        }
+        if ($taskImportExitCode -ne 0) { throw "Toolchain environment setup failed (exit $taskImportExitCode)" }
+        $taskEnvironment | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process') }
+        }
+    } finally {
+        if (Test-Path -LiteralPath $taskCmd) { Remove-Item -LiteralPath $taskCmd -Force }
     }
 }
 $taskCmake = (Get-Command cmake.exe -ErrorAction SilentlyContinue).Source
