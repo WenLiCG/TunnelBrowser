@@ -50,7 +50,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\test_vcvars_import.ps1
 ```
 
-需要 Python 3.11+、Visual Studio 2022 C++ x64 构建工具和 Windows SDK、CMake 3.21+、Ninja。
+构建需要 Python 3.11+、Visual Studio 2022 C++ x64 构建工具和 Windows SDK、CMake 3.21+、Ninja；打正式发布包固定用 Python 3.14.3。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\tools\build.ps1 -Package

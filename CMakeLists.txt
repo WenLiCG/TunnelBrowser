@@ -24,6 +24,8 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
       "$<$<CONFIG:Release>:/experimental:deterministic>"
       "$<$<CONFIG:Release>:/pathmap:${build_source_path}=.>")
   endforeach()
+  target_compile_options(TunnelBrowser PRIVATE "$<$<CONFIG:Release>:/Brepro>")
+  target_link_options(TunnelBrowser PRIVATE "$<$<CONFIG:Release>:/Brepro>")
 endif()
 set_target_properties(TunnelBrowser PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/app")
 add_custom_command(TARGET TunnelBrowser POST_BUILD

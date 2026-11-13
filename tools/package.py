@@ -25,7 +25,20 @@ with tempfile.TemporaryDirectory(dir=archive.parent) as temporary:
     pending = pathlib.Path(temporary) / archive.name
     with zipfile.ZipFile(pending, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as output:
         for name, path in sorted(files.items()):
-            output.write(path, f"TunnelBrowser/{name}")
+            is_directory = name.endswith("/") or path.is_dir()
+            if is_directory and not name.endswith("/"):
+                name += "/"
+            # ZIP's earliest timestamp is fixed, independent of source file mtimes.
+            entry = zipfile.ZipInfo(f"TunnelBrowser/{name}", (1980, 1, 1, 0, 0, 0))
+            entry.create_system = 3
+            if is_directory:
+                entry.external_attr = (0o040755 << 16) | 0x10
+            elif name.lower().endswith(".exe"):
+                entry.external_attr = 0o100755 << 16
+            else:
+                entry.external_attr = 0o100644 << 16
+            output.writestr(entry, b"" if is_directory else path.read_bytes(),
+                            compress_type=zipfile.ZIP_DEFLATED, compresslevel=6)
     with pending.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     pending_checksum = pending.with_suffix(".zip.sha256")

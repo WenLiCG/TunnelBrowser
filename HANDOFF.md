@@ -27,7 +27,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\test_vcvars_import.ps1
 ```
 
-在 Windows x64 上准备 VS 2022 C++ x64 Build Tools、Windows SDK、CMake、Ninja 和 Python。开发机使用 Python 3.14.3，可直接用此版本复现。脚本可在 x64 Native Tools 环境运行，也可用 `vswhere` 寻找已安装的工具链。原机 `downloads/` 下的便携工具链是本地缓存。
+在 Windows x64 上准备 VS 2022 C++ x64 Build Tools、Windows SDK、CMake、Ninja 和 Python。构建需要 Python 3.11+，打正式发布包固定用 Python 3.14.3。脚本可在 x64 Native Tools 环境运行，也可用 `vswhere` 寻找已安装的工具链。原机 `downloads/` 下的便携工具链是本地缓存。
 
 在项目根目录依次执行下列命令。
 
@@ -80,6 +80,19 @@ python .\tests\package_check.py
 - “清空当前 profile”需用户确认。先关闭标签页并完成 `CefShutdown`，再清理固定的 profile 文件和目录。保留 `node.dat`，重启时生成新内部 ID。清理前会验证目标路径归属。损坏的环境参数文件会保留并提示启动失败，排障时先备份并检查 `fingerprint.json`。
 
 ## 验收基线和后续范围
+
+### 安装包一致性验收
+
+正式安装包只在 Windows 上打。同一台机器、同一套工具链（同一 Python 版本、同一 VS/CMake/Ninja）打两次，exe、dll 和 ZIP 必须逐字节一致（SHA-256 相同）。
+
+在其他平台（如 Linux）打出的 ZIP 只要求包内文件一致：条目数、文件名、顺序、CRC、原始大小、日期和文件属性相同。压缩后大小可以不同（不同平台 Python 的 zlib 不同），不算缺陷。
+
+### Windows 测试机远程桌面
+
+- 连接时不得使用 `+auto-reconnect`，不开自动重连。
+- 每个启动远程桌面的脚本都要在日志开头写明由谁（哪个 Bot/人）为哪个任务启动。
+
+### 验收记录和后续范围
 
 - 0.2 发布时通过 21 项原生自检。回环集成通过完整 REALITY/Vision 请求链路，并从服务端访问日志确认流量实际经过代理。覆盖了核心故障时请求失败、主动关闭后恢复直连、原生新标签、黄绿状态、页面和同源 iframe 环境参数，以及重启后 Cookie 和 localStorage 持久化。出包时检查了 ZIP 完整性、运行库哈希和 `xray.exe` 缺席。
 - 2026-11-08 交接时，用现有构建重跑了 21 项自检及三个集成场景，均通过。回环 HTTP fixture 记录了一次 `WinError 10053`（连接被中止），测试最终退出码为 0。重新计算的 ZIP 哈希与发布记录一致。
