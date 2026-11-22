@@ -16,6 +16,21 @@ bool ValidProfile(const Profile& p) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '/' || c == '_' || c == '-' || c == '+';
   });
 }
+bool WriteFileAtomically(const std::filesystem::path& target, const std::string& data) {
+  auto temporary = target;
+  temporary += L".tmp";
+  HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  DWORD written = 0;
+  // Flush before the rename so a crash cannot leave a truncated file under the final name.
+  bool ok = data.size() <= MAXDWORD &&
+            WriteFile(file, data.data(), static_cast<DWORD>(data.size()), &written, nullptr) &&
+            written == data.size() && FlushFileBuffers(file);
+  CloseHandle(file);
+  ok = ok && MoveFileExW(temporary.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+  if (!ok) DeleteFileW(temporary.c_str());
+  return ok;
+}
 bool SaveProfile(const std::filesystem::path& root, const Profile& p) {
   if (!ValidProfile(p)) return false;
   auto dict = CefDictionaryValue::Create();
@@ -23,11 +38,7 @@ bool SaveProfile(const std::filesystem::path& root, const Profile& p) {
   dict->SetString("languages", p.languages); dict->SetString("timezone", p.timezone);
   dict->SetInt("screenWidth", p.screen_width); dict->SetInt("screenHeight", p.screen_height);
   auto value = CefValue::Create(); value->SetDictionary(dict);
-  auto text = CefWriteJSON(value, JSON_WRITER_PRETTY_PRINT).ToString();
-  auto temporary = root / L"fingerprint.json.tmp";
-  std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
-  file.write(text.data(), static_cast<std::streamsize>(text.size())); file.close();
-  return file.good() && MoveFileExW(temporary.c_str(), (root / L"fingerprint.json").c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+  return WriteFileAtomically(root / L"fingerprint.json", CefWriteJSON(value, JSON_WRITER_PRETTY_PRINT).ToString());
 }
 bool LoadProfile(const std::filesystem::path& root, Profile& p) {
   std::error_code error;

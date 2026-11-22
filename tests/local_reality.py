@@ -8,10 +8,8 @@ import pathlib
 import socket
 import ssl
 import subprocess
-import sys
 import tempfile
 import threading
-import time
 import urllib.parse
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization

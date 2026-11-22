@@ -12,7 +12,6 @@
 #include <iostream>
 #include <map>
 #include <memory>
-#include <set>
 #include <charconv>
 #include <thread>
 #include <utility>
@@ -31,14 +30,14 @@
 #include "include/wrapper/cef_closure_task.h"
 #include "node.h"
 #include "profile.h"
+#include "route.h"
 #include "service_domains.h"
 
 namespace {
-enum class Mode { Direct, Switching, Proxy, Blocked };
 std::atomic<Mode> mode{Mode::Direct};
 std::atomic<unsigned> route_generation{0};
 bool ProxyEnabled() { return mode == Mode::Proxy; }
-bool CanBrowse() { return mode == Mode::Direct || mode == Mode::Proxy; }
+bool CanBrowse() { return CanBrowseIn(mode); }
 void ChangeMode(Mode next) { mode = next; ++route_generation; }
 Profile profile;
 std::filesystem::path app_dir, data_dir;
@@ -55,7 +54,7 @@ bool startup_failed = false;
 SOCKET blocked_socket = INVALID_SOCKET;
 int blocked_port = 0, proxy_port = 0;
 std::map<int, std::string> paused_pages;
-std::set<int> unloading;
+PageUnloads unloading;
 std::optional<Mode> switch_target;
 std::wstring switch_status;
 #ifdef TB_TESTING
@@ -86,9 +85,10 @@ std::wstring Text(HWND control) {
 }
 void Status(const std::wstring& text) { SetWindowTextW(status_label, text.c_str()); }
 void Buttons() {
-  EnableWindow(connect_button, !busy && !closing && !ProxyEnabled());
-  EnableWindow(link_edit, !busy && !ProxyEnabled() && !closing);
-  EnableWindow(disconnect_button, !busy && mode != Mode::Direct && !closing);
+  EnableWindow(connect_button, ConnectAllowed(mode, busy, closing));
+  EnableWindow(link_edit, ConnectAllowed(mode, busy, closing));
+  EnableWindow(disconnect_button, DisconnectAllowed(mode, busy, closing));
+  SetWindowTextW(connect_button, ProxyEnabled() ? L"切换 VLESS 节点" : L"启用 VLESS");
 }
 cef_color_t ModeColor() {
   if (mode == Mode::Proxy) return CefColorSetARGB(255, 46, 125, 50);
@@ -156,12 +156,7 @@ bool Protect(const std::string& plain, std::string& encrypted, bool decrypt) {
 }
 bool SaveLink(const std::string& link) {
   std::string encrypted;
-  if (!Protect(link, encrypted, false)) return false;
-  auto temp = data_dir / L"node.dat.tmp";
-  std::ofstream file(temp, std::ios::binary | std::ios::trunc);
-  file.write(encrypted.data(), static_cast<std::streamsize>(encrypted.size()));
-  file.close();
-  return file.good() && MoveFileExW(temp.c_str(), (data_dir / L"node.dat").c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+  return Protect(link, encrypted, false) && WriteFileAtomically(data_dir / L"node.dat", encrypted);
 }
 std::string LoadLink() {
   std::error_code error;
@@ -232,7 +227,8 @@ bool ConfigureProfile(CefRefPtr<CefRequestContext> target) {
 
 void CreatePanel();
 void BlockTraffic(const std::wstring& reason);
-void MainFrameUnloaded(int browser_id);
+void PageLoadEnded(int browser_id, const std::string& url);
+void PageClosed(int browser_id);
 #ifdef TB_TESTING
 void SmokeDone(bool success);
 #endif
@@ -334,8 +330,10 @@ class BrowserClient : public CefClient, public CefLifeSpanHandler, public CefCon
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
   CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
   CefRefPtr<CefCommandHandler> GetCommandHandler() override { return this; }
-  bool OnBeforeBrowse(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, CefRefPtr<CefRequest> request, bool, bool) override {
+  bool OnBeforeBrowse(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, CefRefPtr<CefRequest> request, bool, bool) override {
     auto url = request->GetURL().ToString();
+    // Chromium drops blocked navigations silently; show why instead. ResourceGate still enforces the block.
+    if (mode == Mode::Blocked && frame->IsMain() && IsWebUrl(url)) { if (!closing) ShowSettings(); return true; }
     if (url.starts_with("chrome://settings") || url.starts_with("chrome://profile")) { ShowSettings(); return true; }
     for (std::string_view internal : {"chrome://extensions", "chrome://webstore", "chrome://chrome-signin", "chrome://signin",
                                     "chrome://password-manager", "chrome://sync", "chrome://flags", "chrome://components"})
@@ -405,7 +403,7 @@ class BrowserClient : public CefClient, public CefLifeSpanHandler, public CefCon
   }
 #endif
   void OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, int) override {
-    if (frame->IsMain() && frame->GetURL() == "about:blank") MainFrameUnloaded(browser->GetIdentifier());
+    if (frame->IsMain()) PageLoadEnded(browser->GetIdentifier(), frame->GetURL().ToString());
   }
   void OnLoadStart(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, TransitionType) override {
     if (!frame->IsMain()) return;
@@ -439,7 +437,7 @@ class BrowserClient : public CefClient, public CefLifeSpanHandler, public CefCon
       if (closing) return;
       for (const auto& remaining : browsers) SetTimezone(remaining->GetHost(), 10003);
     }), 200);
-    MainFrameUnloaded(browser->GetIdentifier());
+    PageClosed(browser->GetIdentifier());
   }
   void OnBeforeContextMenu(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, CefRefPtr<CefContextMenuParams>,
       CefRefPtr<CefMenuModel> model) override {
@@ -523,14 +521,15 @@ void DrainConnections() {
 }
 
 void UnloadPages() {
+  unloading.Begin();
   for (const auto& browser : browsers) {
     browser->StopLoad();
     auto frame = browser->GetMainFrame();
     auto url = frame->GetURL().ToString();
-    if (!url.starts_with("http://") && !url.starts_with("https://")) continue;
+    if (!IsWebUrl(url)) continue;
     int id = browser->GetIdentifier();
     paused_pages.try_emplace(id, url);
-    unloading.insert(id);
+    unloading.Track(id);
     frame->LoadURL("about:blank");
   }
 }
@@ -573,13 +572,15 @@ bool PauseTraffic(const wchar_t* message) {
 }
 
 void BeginConnect() {
-  if (busy || ProxyEnabled() || closing) return;
+  if (!ConnectAllowed(mode, busy, closing)) return;
   auto link = Utf8(Text(link_edit));
   if (link.empty()) link = LoadLink();
   std::string error;
   auto node = ParseNode(link, error);
   if (!node) { Status(Wide(error)); return; }
-  if (!PauseTraffic(L"正在启用 VLESS，当前网页将通过新线路重新打开……")) return;
+  // Switching from an active node goes through the blocked route; open pages never reload directly.
+  if (!PauseTraffic(ProxyEnabled() ? L"正在切换 VLESS 节点，当前网页将通过新线路重新打开……"
+                                   : L"正在启用 VLESS，当前网页将通过新线路重新打开……")) return;
   worker = std::thread([link, node = std::move(*node)] {
     int port = core.Stop() ? FreePort() : 0;
     if (port && !core.Start(MakeConfig(node, port))) {
@@ -591,12 +592,12 @@ void BeginConnect() {
   });
 }
 void Disconnect() {
-  if (busy || mode == Mode::Direct || closing) return;
+  if (!DisconnectAllowed(mode, busy, closing)) return;
   if (!PauseTraffic(L"正在关闭 VLESS，当前网页将通过直连重新打开……")) return;
   worker = std::thread([] { bool ok = core.Stop(); PostMessageW(panel, kComplete, ok ? 3 : 4, 0); });
 }
 void ResumeTraffic() {
-  if (!switch_target || !unloading.empty()) return;
+  if (!switch_target || !unloading.Idle()) return;
   auto next = *switch_target;
   switch_target.reset();
   if (closing && browsers.empty()) { busy = false; FinishClose(); return; }
@@ -628,8 +629,12 @@ void ResumeTraffic() {
     }, pending, next, generation)));
   }
 }
-void MainFrameUnloaded(int browser_id) {
-  unloading.erase(browser_id);
+void PageLoadEnded(int browser_id, const std::string& url) {
+  unloading.LoadEnded(browser_id, url);
+  ResumeTraffic();
+}
+void PageClosed(int browser_id) {
+  unloading.Closed(browser_id);
   ResumeTraffic();
 }
 void FinishSwitch(Mode next, const std::wstring& message) {
@@ -898,6 +903,10 @@ int SelfTest() {
   auto ipv6 = link; ipv6.replace(ipv6.find("127.0.0.1"), 9, "[::1]");
   auto parsed6 = ParseNode(ipv6, error);
   if (!check(parsed6 && parsed6->host == "::1", "IPv6 share URL")) return 1;
+  auto untyped = link; untyped.erase(untyped.find("type=tcp&"), 9);
+  if (!check(ParseNode(untyped, error).has_value(), "omitted type defaults to RAW/TCP")) return 1;
+  if (!check(ConnectAllowed(Mode::Proxy, false, false) && !ConnectAllowed(Mode::Switching, true, false),
+      "switch node without a direct hop")) return 1;
   if (!check(ParseNode(link + "&spx=%2Fdocs%3Fid%3D1", error).has_value() &&
       !ParseNode(link + "&spx=https%3A%2F%2Fexample.com", error), "spider path stays within the node origin")) return 1;
   if (!check(ServiceDomain("update.googleapis.com.") && ServiceDomain("clients2.google.com") &&
@@ -928,6 +937,12 @@ int SelfTest() {
   if (!check(SaveProfile(temp, loaded) && LoadProfile(temp, loaded) && loaded.id == original.id && loaded.screen_width == 1600, "environment settings persist without rotating profile")) return 1;
   auto invalid = loaded; invalid.screen_width = 0;
   if (!check(!SaveProfile(temp, invalid) && LoadProfile(temp, loaded) && loaded.screen_width == 1600, "invalid settings preserve previous profile")) return 1;
+  if (!check(!std::filesystem::exists(temp / L"fingerprint.json.tmp"), "atomic save leaves no temporary file")) return 1;
+  auto unwritable = temp / L"unwritable";
+  std::filesystem::create_directories(unwritable / L"fingerprint.json", fs_error);
+  if (!check(!fs_error && !SaveProfile(unwritable, loaded) && !std::filesystem::exists(unwritable / L"fingerprint.json.tmp"),
+      "failed save removes its temporary file")) return 1;
+  std::filesystem::remove_all(unwritable, fs_error);
   std::filesystem::create_directory(temp / L"profile", fs_error);
   { std::ofstream cookie(temp / L"profile" / L"Cookies"); cookie << "test"; }
   std::filesystem::create_directory(temp / L"Default", fs_error);
@@ -995,7 +1010,9 @@ int Run(HINSTANCE instance, void* sandbox) {
 #ifdef TB_TESTING
     if (smoke_report.empty())
 #endif
-      MessageBoxW(nullptr, L"当前 profile 的环境参数无法读取。请检查 fingerprint.json 和目录权限。", L"Tunnel Browser", MB_ICONERROR);
+      MessageBoxW(nullptr, (L"当前 profile 的环境参数无法读取：\n" + (data_dir / L"fingerprint.json").wstring() +
+        L"\n\n请检查该文件和目录权限。若文件已损坏，可将其改名备份后重新启动；程序会生成默认环境参数，"
+        L"浏览资料与已保存节点不受影响，语言、时区和屏幕尺寸需重新设置。").c_str(), L"Tunnel Browser", MB_ICONERROR);
     return 1;
   }
   CefSettings settings;

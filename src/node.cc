@@ -121,7 +121,8 @@ std::optional<Node> ParseNode(const std::string& input, std::string& error) {
       return {};
     }
   }
-  if ((query["type"] != "tcp" && query["type"] != "raw") || query["security"] != "reality" ||
+  // Share links may omit `type`; the VLESS share-link convention defaults it to RAW/TCP.
+  if ((!query["type"].empty() && query["type"] != "tcp" && query["type"] != "raw") || query["security"] != "reality" ||
       query["flow"] != "xtls-rprx-vision" || (!query["encryption"].empty() && query["encryption"] != "none") ||
       (!query["headerType"].empty() && query["headerType"] != "none")) return {};
   node.sni = query["sni"];
