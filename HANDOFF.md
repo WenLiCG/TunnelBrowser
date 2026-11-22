@@ -191,3 +191,100 @@ python .\tests\package_check.py
 - 本地 SOCKS 绑定回环，禁用 UDP，无直连回退。每次启用重新选择端口。会话代数用于忽略上次代理的晚到错误。
 - 维护 CEF 启动 flags、每个浏览上下文的偏好、CEF 请求过滤和 libXray 出站规则。禁用 Google 浏览器服务的验证范围是当前构建的集成及已知域名，操作系统的 DNS、其他程序或用户访问的网站各自运行。
 - CEF 150 的 `CloseAllConnections` 须传有效回调。libXray 是 Go DLL，模块在进程退出时由系统回收。分发时保留 [第三方归属](THIRD_PARTY.md) 和随包通知。
+
+## Independent cloud verification (2026-11-22)
+
+这次核对只导入并审查已有候选，没有改产品逻辑。上面的 CLI review 和 0.3.0 交接原文保持不变。允许打开一个 PR 并不等于批准按钮文案或其他产品取舍。没有合并、没有自动合并、没有发布、没有部署，也没有使用真实节点或用户电脑。
+
+### 基线、补丁和提交映射
+
+| 项 | 值 |
+| --- | --- |
+| 补丁 SHA-256 | `e4aeeebe5c1d9a7f3a6b52aab2695d66f958403c2dd64cde6d7fbac30306656a`（`sha256sum` 退出码 0，与交接记录一致） |
+| 导入命令 | `git am --keep-cr`，退出码 0。Git 打印 `warning: quoted CRLF detected`。导入后的完整树仍是记录中的树，`src/app.cc` 仍是 CRLF。 |
+| 源基线 / 导入时的 `origin/main` | `35ed6cb5a034cf61a8a806630f3f63a951b40c72`。`git fetch origin main` 退出码 0；`git log 35ed6cb..origin/main` 为空。main 没有新提交，因此没有冲突需要保留。发布前再次 fetch，结果相同。 |
+| 源码提交 | 源 `5b55d5f5ba0df74780a4cfbe4386d624846be11f` → 导入 `cd17ccb1a11f5daaf412e586ce4f592daa7f33ed`。树 `51f445a94e8401545f86c52a1a98b765b62a66ca`。父提交是源基线。 |
+| 源交接提交 | 源 `d35f61eb8c14cdc735c8a28ecc8d70afaafcc2d5` → 导入 `d1f31973e46eec567a26eb3616a347d163dc3db3`。树 `a4d8a13c4f1826dbb7c3b464c80c9dbd82ba846c`，与记录的完整树一致。 |
+| 作者 | 两个导入提交的作者都是 `Claude Code review <claude-code-review@local>`，作者日期未改。 |
+| 提交者 | `Cursor Agent <cursoragent@cursor.com>`，提交者日期 `Sun, 22 Nov 2026 23:32:45 +0000`。SHA 变化只来自提交者身份和时间。 |
+| 独立测试提交 | `39fe5aa2a41d649f725febd52a9897c93906e83d`，父提交 `d1f31973e46eec567a26eb3616a347d163dc3db3`，树 `ab873133c226a06790eab51cc62f20819720e55d`。 |
+| 本附录 | 加在独立测试提交之上。它不能写进自己的 SHA；用 `git rev-parse HEAD` 读取。 |
+| 发布分支 | `cursor/vless-fail-closed-switch-f4dd`。没有 force-push，也没有改写已经推送的提交。 |
+
+### 环境
+
+Linux 6.12.113+ x86_64 容器。Python 3.12.3。clang++ 18.1.3。g++ 13.3.0。CMake 3.28.3。ruff 0.17.6 和 pyflakes 4.1.0 装在会话临时目录 `/tmp/lint-deps`，没有写入仓库。没有 Windows、MSVC、PowerShell、`pwsh`，apt 里也没有 `python3.13` 或 `powershell`。没有访问用户的 Windows 电脑。
+
+clang++ 最初选中 GCC 14，但当时没有 GCC 14 的 C++ 头文件，`#include <iostream>` 直接失败。同一时刻 g++ 13.3.0 能编译并运行宿主测试。随后只在这台 VM 安装了 `libstdc++-14-dev 14.2.0-4ubuntu2~24.04.1`，没有改仓库。安装后 clang++ 可以编译，下面的默认 `unittest` 使用的就是这支 clang++。
+
+### 命令和退出码
+
+| 命令 | 退出码 | 结果 |
+| --- | --- | --- |
+| `sha256sum` 补丁 | 0 | 哈希与记录一致 |
+| `git fetch origin main`（导入前、写本附录前各一次） | 0 | `origin/main` 仍是 `35ed6cb5a034cf61a8a806630f3f63a951b40c72` |
+| `git am --keep-cr` | 0 | 两个提交都应用。有 quoted CRLF 警告；完整树匹配 |
+| `git diff --check` 与 `git -c core.whitespace=cr-at-eol diff --check` | 0 / 0 | 无空白错误 |
+| `g++ -std=c++20 -Wall -Wextra` 分别链接并运行 `independent_test`、`node_test`、`route_test` | 编译 0，运行 0 | 三条都打印 PASS。这是安装 GCC 14 头文件之前的结果 |
+| `python3 -m unittest discover -s tools -p "test_*.py" -v` | **1** | 20 项里 19 项通过，1 项错误。见下方失败 |
+| `python3 -m ruff check tools tests`（ruff 0.17.6） | **1** | 12 条，全部在既有文件。新独立测试没有新增 |
+| `python3 -m pyflakes tools tests`（pyflakes 4.1.0） | 0 | 无输出 |
+| `cmake -S . -B /tmp/tb-cmake-gxx -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++` | **1** | `CMakeLists.txt:4`：`Windows x64 is required`。这不是 Windows 构建 |
+| 默认 `c++`（clang）在安装 GCC 14 头文件之前跑 CMake | **1** | 链接失败：`cannot find -lstdc++`。还没执行到项目自己的 Windows 检查 |
+| `python3 tests/local_reality.py` | **1** | `OSError: .../build/test/libXray.dll: cannot open shared object file`。`run()` 的第一条就是加载 DLL，本地夹具服务器没有启动 |
+| `powershell` / `pwsh` | 127 / 不存在 | `tools/build.ps1` 没有解析，也没有执行 |
+| `gh api repos/WenLiCG/TunnelBrowser/actions/workflows` | 0 | `total_count` 为 0 |
+| Actions runs、deployments、environments、rulesets | 0 | 都是空。hooks 列表返回 403，无法枚举 webhook |
+
+`unittest` 的那一个错误是 `test_zip_bytes_ignore_source_metadata`：`tools/package.py:46` 设置 `ZipInfo.compress_level`，Python 3.12.3 的 `ZipInfo` 没有这个属性。`tools/package.py` 和 `tools/test_package_reproducible.py` 相对 `35ed6cb` 没有差异。作者记录的 8/8 是在 Python 3.13.5 上跑的；这里没有 3.13，不能复现那次通过，也不把这次错误算成候选引入的回归。没有为了让 3.12 通过而改打包逻辑。
+
+作者原有 8 个测试在这台 Python 3.12.3 上是 7 通过、1 错误。候选新增的宿主测试 3 项通过。本次新增 11 项独立测试全部通过。不要把这次结果说成作者那句“lint clean”，也不要把 Linux 测试说成 Windows 构建、原生自检或 GUI 通过。
+
+ruff 0.17.6 的 12 条是：`tests/local_reality.py` 的 I001、三条 RUF012、UP017；`tools/test_cmake_brepro.py` 的 FURB167；`tools/test_host_cpp.py` 的两条 PLW1510（`subprocess.run` 没有显式 `check`）；`tools/test_package_reproducible.py` 的 I001；`tools/test_vcvars_import.py` 的 I001、UP032、UP030。作者当时描述为 12 条、其中新文件里一条；这个 ruff 版本在 `test_host_cpp.py` 里看到两条 PLW1510。
+
+### 独立测试相对作者测试
+
+独立测试读的是导入后的 `src/node.cc`、`src/route.h` 和源码文本，没有改这些产品文件。
+
+- 省略 `type`、空 `type=`、`type=tcp` 和 `type=raw` 生成同一份配置：回环 `127.0.0.1`、`noauth`、UDP 关闭、没有 `freedom` 或 direct 出站、第一条出站是 VLESS、`network` 为 raw、日志关闭、没有 `domainStrategy`、服务域名进 blackhole。
+- `ws`、`grpc`、`xhttp`、`httpupgrade`、`quic`、大小写和空白 `type` 仍拒绝。`pqv`、`host=`、`path=`（包括空值）仍拒绝。省略 `type` 时仍要求 REALITY 和 Vision，并拒绝 UDP/443 flow 和站外 `spx`。错误文本不回显夹具 UUID 或公钥。
+- `ConnectAllowed(Proxy)` 为真，因此换节点不必先回到直连。`PauseTraffic` 先置 `busy`，再进入 `Switching`，然后 `ApplyRoute(Blocked)`、排空连接、卸载页面；这段路径没有 `Mode::Direct`。只有 `kComplete` 且 `w == 3` 会 `FinishSwitch(Mode::Direct)`。启动失败走 `BlockTraffic`。
+- 内部页可以结束一次等待，下一次 `Begin()` 不继承这次等待。一个标签进内部页不会放行另一个仍是网页的标签。
+- `WriteFileAtomically` 在 `MoveFileExW` 之前调用 `FlushFileBuffers`，失败时 `DeleteFileW`。`SaveProfile` 先拒绝非法 profile。`SaveLink` 先 DPAPI，再原子写 `node.dat`。`ResetProfileData` 覆盖 `fingerprint.json.tmp`，不删除 `node.dat`。这些是源码顺序检查，不是 Windows API 的实际落盘。
+- 静态数出原生 `SelfTest` 会执行 27 次 `check`（畸形链接循环 6 次）。这不是已经跑出来的 `PASS: 27 checks`。
+- 可见文案 `切换 VLESS 节点` 被测试锁住，用来防止候选在审查期间丢文案。测试不表示文案已经被产品接受。初始按钮仍是 `启用 VLESS`，直连按钮仍是 `关闭 VLESS · 直连`。
+- `runtime.json` 仍是 `0.3.0`。沙箱、`command_line_args_disabled` 和危险开关拒绝没有被这个候选改动。
+
+### 未决产品问题
+
+没有替下面任何一项选新行为。
+
+- 本地 SOCKS 入站是 `127.0.0.1` 上的 `noauth`。VLESS 开启时，其他本机进程，以及共享回环的其他已登录 Windows 用户，都可以使用这条隧道。候选没有改。
+- `chrome://settings` 会转到自有设置面板，密码和站点权限页面到不了。`chrome://password-manager` 被拦截。是否关闭密码管理器，或改为放行这些页面，需要先在 Windows 上验证。
+- 每次启动仍是黄色直连。没有“始终 VLESS”或自动连接。
+- `pqv`、`host` 和 `path` 继续拒绝。支持 `pqv` 需要把它送进 `realitySettings`，并增加 ML-DSA 回环测试。
+- 按钮在 VLESS 已启用时显示 `切换 VLESS 节点`。这是用户能看见的产品变化。成功状态仍写 `VLESS 已启用。`，即使这次操作是换节点。后一句只是阅读代码时的观察，没有改文案。
+
+### 风险
+
+- `app.cc` 里的换线、内部页放行和红色状态下打开设置，只在宿主规则和源码顺序上检查过，没有在 Windows CEF 里跑过。
+- `PageUnloads` 把任何非网页主框架加载视为卸载完成，但 `ResumeTraffic` 只在主框架正好是 `about:blank` 时恢复原页面。内部页因此不会把旧页面经直连重新打开；该标签也不会自动回到原网址。这是当前代码的行为，没有另写一套恢复逻辑。
+- `DisconnectAllowed(Switching, busy=false)` 为真。`PauseTraffic` 在进入 `Switching` 之前把 `busy` 设为真，源码测试锁住了这个顺序。Windows 运行时没有覆盖它。
+- 连接按钮逻辑宽度是 277。高 DPI 下是否裁切 `切换 VLESS 节点`，没有在 100%、150%、200% 上看过。
+- 0.3.0 ZIP 的 SHA-256 描述的是旧包。这次没有重新打包。
+
+### 回滚
+
+没有数据格式变化。`fingerprint.json` 仍是 `version: 1`，DPAPI `node.dat` 和 `*.tmp` 名称不变。回滚是撤回这个分支上的提交，或继续使用现有 0.3.0 ZIP。两种版本读同一份 `%LOCALAPPDATA%\TunnelBrowser`。不要为了这次候选去改用户目录。
+
+### 仍需在 Windows x64 上做的检查
+
+仓库没有 GitHub Actions，也没有可用的 Windows runner。下面各项都还没有执行：
+
+1. `powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\test_vcvars_import.ps1`
+2. `python -m unittest discover -s tools -p "test_*.py" -v`（Windows 上 `test_host_cpp.py` 和 `test_independent_cpp.py` 会按设计跳过）
+3. `powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build.ps1 -Test`，期望原生输出 `PASS: 27 checks`。必须是 MSVC 构建加实际 `--self-test`，不能用这次的源码计数或 clang 语法检查代替。
+4. 在同一 Python 环境安装 `cryptography` 后运行 `python .\tests\local_reality.py`。只用它自己的回环夹具，不用真实节点，也不要让浏览器走外部隧道。
+5. 隔离资料目录下的界面检查：VLESS 为绿色时切换第二个节点，打开的页面经新节点重开，夹具或 netlog 里没有直连请求；切换过程中打开 `chrome://history`，不能出现红色“关闭旧连接超时”；红色状态下输入 `http(s)` 网址，设置面板出现且夹具收不到请求；损坏仅用于测试的 `fingerprint.json` 后，错误要给出完整路径和恢复说明，改名后能启动；在 100%、150% 和 200% DPI 下看设置面板，确认更长的按钮文字没有被裁切。
+
+发布包、`tests/package_check.py` 和 `runtime.json` 版本号仍留到真正发布时再做。
