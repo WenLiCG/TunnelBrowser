@@ -1,4 +1,7 @@
 #include "node.h"
+#include "service_domains.h"
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <algorithm>
 #include <charconv>
 #include <map>
@@ -29,10 +32,34 @@ bool Hex(std::string_view text) {
 }
 bool Host(std::string_view text, bool ipv6) {
   if (text.empty() || text.size() > 253) return false;
-  return std::all_of(text.begin(), text.end(), [ipv6](unsigned char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-      (c >= '0' && c <= '9') || c == '.' || c == '-' || (ipv6 && c == ':');
-  });
+  if (ipv6) {
+    IN6_ADDR address{};
+    return InetPtonA(AF_INET6, std::string(text).c_str(), &address) == 1;
+  }
+  if (text.ends_with('.')) text.remove_suffix(1);
+  while (!text.empty()) {
+    auto dot = text.find('.');
+    auto label = text.substr(0, dot);
+    if (label.empty() || label.size() > 63 || label.starts_with('-') || label.ends_with('-') ||
+        !std::all_of(label.begin(), label.end(), [](unsigned char c) {
+          return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-';
+        })) return false;
+    if (dot == std::string_view::npos) return true;
+    text.remove_prefix(dot + 1);
+  }
+  return false;
+}
+
+bool SpiderPath(std::string_view text) {
+  if (text.empty()) return true;
+  if (!text.starts_with('/') || text.starts_with("//") || text.find_first_of(" #\\") != std::string_view::npos)
+    return false;
+  for (size_t i = 0; i < text.size(); ++i) {
+    if (text[i] != '%') continue;
+    if (i + 2 >= text.size() || !Hex(text.substr(i + 1, 2))) return false;
+    i += 2;
+  }
+  return true;
 }
 }
 
@@ -99,9 +126,11 @@ std::optional<Node> ParseNode(const std::string& input, std::string& error) {
       (!query["headerType"].empty() && query["headerType"] != "none")) return {};
   node.sni = query["sni"];
   node.public_key = query["pbk"];
+  if (node.public_key.size() == 44 && node.public_key.back() == '=') node.public_key.pop_back();
   node.short_id = query["sid"];
   node.fingerprint = query["fp"].empty() ? "chrome" : query["fp"];
   node.spider = query["spx"];
+  if (!SpiderPath(node.spider)) { error = "节点的 spx 必须是有效的站内路径。"; return {}; }
   if (!Host(node.sni, false) || node.public_key.size() != 43 || node.short_id.size() > 16 ||
       node.short_id.size() % 2 != 0 || !Hex(node.short_id)) return {};
   if (!std::all_of(node.public_key.begin(), node.public_key.end(), [](unsigned char c) {
@@ -109,12 +138,18 @@ std::optional<Node> ParseNode(const std::string& input, std::string& error) {
     })) return {};
   if (node.fingerprint != "chrome" && node.fingerprint != "firefox" && node.fingerprint != "safari" &&
       node.fingerprint != "edge" && node.fingerprint != "ios" && node.fingerprint != "android" &&
-      node.fingerprint != "random" && node.fingerprint != "randomized") return {};
+      node.fingerprint != "random" && node.fingerprint != "randomized" && node.fingerprint != "qq" &&
+      node.fingerprint != "360") return {};
   error.clear();
   return node;
 }
 
 std::string MakeConfig(const Node& n, int port) {
+  std::string blocked;
+  for (auto domain : kServiceDomains) {
+    if (!blocked.empty()) blocked += ',';
+    blocked += JsonString("domain:" + std::string(domain));
+  }
   return "{\"log\":{\"loglevel\":\"none\"},\"inbounds\":[{\"listen\":\"127.0.0.1\",\"port\":" +
     std::to_string(port) + ",\"protocol\":\"socks\",\"settings\":{\"auth\":\"noauth\",\"udp\":false}}],"
     "\"outbounds\":[{\"protocol\":\"vless\",\"settings\":{\"address\":" + JsonString(n.host) +
@@ -122,5 +157,7 @@ std::string MakeConfig(const Node& n, int port) {
     ",\"encryption\":\"none\",\"flow\":\"xtls-rprx-vision\"},\"streamSettings\":{\"network\":\"raw\","
     "\"security\":\"reality\",\"realitySettings\":{\"serverName\":" + JsonString(n.sni) +
     ",\"password\":" + JsonString(n.public_key) + ",\"shortId\":" + JsonString(n.short_id) +
-    ",\"fingerprint\":" + JsonString(n.fingerprint) + ",\"spiderX\":" + JsonString(n.spider) + "}}}]}";
+    ",\"fingerprint\":" + JsonString(n.fingerprint) + ",\"spiderX\":" + JsonString(n.spider) + "}}},"
+    "{\"tag\":\"blocked\",\"protocol\":\"blackhole\"}],\"routing\":{\"rules\":[{"
+    "\"type\":\"field\",\"domain\":[" + blocked + "],\"outboundTag\":\"blocked\"}]}}";
 }

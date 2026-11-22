@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, x25519
@@ -26,8 +27,21 @@ def free_port():
         return listener.getsockname()[1]
 
 
+def check_browser_network(folder):
+    log = json.loads((folder / "netlog.json").read_text(encoding="utf-8"))
+    events = log["events"]
+    hosts = {urllib.parse.urlsplit(event.get("params", {}).get("url", "")).hostname for event in events}
+    assert hosts <= {None, "127.0.0.1", "tunnelbrowser.invalid"}, hosts
+    # Chromium checks the IPv6 route with a UDP socket. Verify it sends no data there.
+    types = log["constants"]["logEventTypes"]
+    probes = {event["source"]["id"] for event in events
+              if event.get("params", {}).get("address") == "[2001:4860:4860::8888]:443"}
+    assert not any(event["type"] == types["UDP_BYTES_SENT"] and event["source"]["id"] in probes
+                   for event in events)
+
+
 def run():
-    app = ROOT / "build" / "app"
+    app = ROOT / "build" / "test"
     lib = ctypes.CDLL(str(app / "libXray.dll"))
     lib.CGoInvoke.argtypes = [ctypes.c_char_p]
     lib.CGoInvoke.restype = ctypes.c_void_p
@@ -47,20 +61,30 @@ def run():
         requests = 0
         reports = []
         accept_languages = []
+        paths = []
 
         def do_GET(self):
             Site.requests += 1
+            Site.paths.append(self.path)
             Site.accept_languages.append(self.headers.get("Accept-Language", ""))
+            if self.path in ("/favicon.ico", "/?blocked", "/?offline-check"):
+                self.send_response(204)
+                self.end_headers()
+                return
             page = b"<!doctype html><title>Frame</title>" if self.path == "/frame" else b'''<!doctype html><title>Checking environment</title>
-<h1>Tunnel Browser integration test</h1><script>
+<h1>Tunnel Browser integration test</h1><input required><script>
 (async () => {
  const existing = localStorage.getItem('identity');
+ const previousCookie = document.cookie;
  const identity = existing || crypto.randomUUID();
- localStorage.setItem('identity', identity);
- document.cookie = 'identity=' + identity + '; Max-Age=31536000; SameSite=Lax; Path=/';
+ if (!existing) {
+   localStorage.setItem('identity', identity);
+   document.cookie = 'identity=' + identity + '; Max-Age=31536000; SameSite=Lax; Path=/';
+ }
  const frame = document.createElement('iframe'); frame.src = '/frame';
  const ready = new Promise(resolve => frame.onload = resolve); document.body.append(frame); await ready;
- const report = {existing, identity, cookie: document.cookie, page: location.search,
+ const report = {existing, identity, previousCookie, cookie: document.cookie, page: location.search,
+   pushMessaging: typeof PushManager, validationMessage: document.querySelector('input').validationMessage,
    language: navigator.language, languages: navigator.languages,
    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, width: screen.width, height: screen.height,
    frame: {language: frame.contentWindow.navigator.language,
@@ -78,7 +102,14 @@ def run():
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length", "0"))
-            Site.reports.append(json.loads(self.rfile.read(length)))
+            body = self.rfile.read(length)
+            if self.path == "/?popup-post" and body == b"check=original":
+                self.do_GET()
+                return
+            if self.path != "/report":
+                self.send_error(400)
+                return
+            Site.reports.append(json.loads(body))
             self.send_response(200)
             self.send_header("Content-Length", "2")
             self.end_headers()
@@ -141,24 +172,35 @@ def run():
             report = json.loads(report_path.read_text()) if report_path.exists() else {}
             assert status == 0 and report.get("success"), (status, report, str(folder))
             assert report["yellow"] and (scenario != "proxy" or report["green"]), report
+            check_browser_network(folder)
             if scenario == "direct":
-                assert report["tabs"] >= 2, report
+                assert report["tabs"] >= 4, report
             assert json.loads((profile_dir / "fingerprint.json").read_text()) == expected
             print("PASS:", scenario, report, flush=True)
         assert Site.requests > 0, "Fixture never received a web request"
+        assert not ({"/?blocked", "/?offline-check"} & set(Site.paths)), Site.paths
+        assert {"/?tab2", "/?popup-get", "/?popup-post", "/?direct-after-disable"} <= set(Site.paths), Site.paths
         access = (folder / "server-access.log").read_text(encoding="utf-8")
         assert f"127.0.0.1:{site.server_port}" in access, "VLESS server did not carry the browser request"
+        assert "tunnelbrowser.invalid" not in access, "Browser service request was forwarded to the VLESS node"
         assert len(Site.reports) >= 6, Site.reports
         identity = Site.reports[0]["identity"]
         for i, report in enumerate(Site.reports):
             assert report["language"] == "en-US" and report["languages"] == ["en-US", "en"], report
-            assert report["timezone"] == "America/New_York" and report["width"] == 1600 and report["height"] == 900, report
-            assert report["frame"] == {"language": "en-US", "timezone": "America/New_York", "width": 1600, "height": 900}, report
+            assert report["timezone"] == "America/New_York", report
+            frame = report["frame"]
+            assert frame["language"] == "en-US" and frame["timezone"] == "America/New_York", report
+            if not report["page"].startswith("?popup-"):
+                assert (report["width"], report["height"]) == (1600, 900), report
+                assert (frame["width"], frame["height"]) == (1600, 900), report
             assert report["identity"] == identity and (i == 0 or report["existing"] == identity), report
+            assert report["previousCookie"] == ("" if i == 0 else f"identity={identity}"), report
             assert identity in report["cookie"], report
+            assert report["pushMessaging"] == "undefined", report
+            assert report["validationMessage"] == "Please fill out this field.", report
         assert all(value.startswith("en-US") for value in Site.accept_languages), Site.accept_languages
         (folder / "environments.json").write_text(json.dumps(Site.reports, indent=2), encoding="utf-8")
-        print("PASS: proxy failure blocks traffic; explicit disable restores direct; native tabs, colors, page/iframe parameters, cookies and profile survive restart")
+        print("PASS: fail-closed, explicit restore, native tabs, GET/POST popups, locale, cookies and browser-service network checks")
         print("Test artifacts:", folder)
     finally:
         (folder / "environments.json").write_text(json.dumps(Site.reports, indent=2), encoding="utf-8")

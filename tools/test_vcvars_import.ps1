@@ -12,11 +12,12 @@ $block = $ast.Find({ param($node)
 }, $true)
 if (-not $block) { throw 'Toolchain import guard not found' }
 $import = [scriptblock]::Create($block.Extent.Text)
-$fixture = Join-Path ([IO.Path]::GetTempPath()) ('TB vcvars ' + [guid]::NewGuid())
+$fixture = Join-Path ([IO.Path]::GetTempPath()) ('TB vcvars ' + [char]0x8DEF + [char]0x5F84 + ' ' + [guid]::NewGuid())
 $originalPath = $env:PATH
 $originalTemp = $env:TEMP
 $originalTmp = $env:TMP
 $originalMarker = $env:TB_VCVARS_TEST
+$originalDirectory = $env:TB_VCVARS_TEST_DIRECTORY
 try {
     $taskRoot = $fixture
     $setupDir = Join-Path $fixture 'downloads\toolchain\msvc'
@@ -28,12 +29,13 @@ try {
     $env:PATH = "$env:SystemRoot\System32"
     if (Get-Command cl.exe -ErrorAction SilentlyContinue) { throw 'Fixture must start without cl.exe' }
     $setup = Join-Path $setupDir 'setup_x64.bat'
-    Set-Content -LiteralPath $setup -Encoding ASCII -Value "@echo off`r`nset TB_VCVARS_TEST=imported=value"
+    Set-Content -LiteralPath $setup -Encoding ASCII -Value "@echo off`r`nset TB_VCVARS_TEST=imported=value`r`nset TB_VCVARS_TEST_DIRECTORY=%~dp0"
     $env:TB_VCVARS_TEST = $null
     & $import
     if ($env:TB_VCVARS_TEST -ne 'imported=value') { throw 'Spaced vcvars path did not import environment' }
+    if ($env:TB_VCVARS_TEST_DIRECTORY -ne ($setupDir + '\')) { throw 'Unicode path did not survive toolchain import' }
     if (@(Get-ChildItem -LiteralPath $tempDir -Force).Count) { throw 'Temporary wrapper leaked after success' }
-    Write-Output 'PASS: spaced path imports into current process; temporary files removed'
+    Write-Output 'PASS: Unicode path with spaces imports into current process; temporary files removed'
 
     Set-Content -LiteralPath $setup -Encoding ASCII -Value "@echo off`r`nexit /b 23"
     $failed = $false
@@ -60,5 +62,6 @@ try {
     $env:TEMP = $originalTemp
     $env:TMP = $originalTmp
     $env:TB_VCVARS_TEST = $originalMarker
+    $env:TB_VCVARS_TEST_DIRECTORY = $originalDirectory
     Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
 }

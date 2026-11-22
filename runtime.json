@@ -1,0 +1,24 @@
+{
+  "version": "0.3.0",
+  "cef": "150.0.24+g62e98ba+chromium-150.0.7871.289",
+  "cef_sha256": "ddfb6237a490c16a8a5b7815e8bd0597dca43ab69fbef0c08610b4e970cc7dcd",
+  "libxray": "26.10.31",
+  "cef_files": [
+    "Release/chrome_elf.dll",
+    "Release/d3dcompiler_47.dll",
+    "Release/libcef.dll",
+    "Release/libEGL.dll",
+    "Release/libGLESv2.dll",
+    "Release/v8_context_snapshot.bin",
+    "Resources/chrome_100_percent.pak",
+    "Resources/chrome_200_percent.pak",
+    "Resources/icudtl.dat",
+    "Resources/resources.pak",
+    "Resources/locales/de.pak",
+    "Resources/locales/en-GB.pak",
+    "Resources/locales/en-US.pak",
+    "Resources/locales/fr.pak",
+    "Resources/locales/ja.pak",
+    "Resources/locales/zh-CN.pak"
+  ]
+}

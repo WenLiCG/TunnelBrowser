@@ -1,101 +1,57 @@
-# Tunnel Browser 0.2.0 开发交接
+# Tunnel Browser 0.3.0 开发交接
 
-交接日期 2026-11-08。项目是一个 Windows x64 专用浏览器，优先保证普通网站和原生多标签稳定运行。使用 CEF 的 Chrome 风格界面与 Chromium 多进程沙箱，按需在浏览器主进程内运行 libXray。用户操作见 [README](README.md)，依赖版本、来源和许可证见 [THIRD_PARTY](THIRD_PARTY.md)。
+发布包面向 Windows x64。CEF Chrome Runtime 提供原生标签页，官方启动器维持 Chromium 多进程沙箱，libXray 在启用 VLESS 时按需加载。
 
-## 接手需要哪些文件
+## 交接状态
 
-- 从 [GitHub 仓库](https://github.com/WenLiCG/TunnelBrowser) 克隆源码，使用 `v0.2.0` 标签复现当前公开版本。
-- `build/`、`downloads/`、`third_party/`、`dist/` 都是忽略目录。前三者分别是构建输出、下载和本机工具缓存、已解包依赖，换机器可以重新生成。
-- 从 [v0.2.0 Release](https://github.com/WenLiCG/TunnelBrowser/releases/tag/v0.2.0) 下载 Windows x64 ZIP 和配套的 `.sha256` 校验文件。解压完整目录后运行 `TunnelBrowser.exe`。包尚未签名。
-- 用户数据在 `%LOCALAPPDATA%\TunnelBrowser`，与源码、二进制交接分开。普通故障报告提供脱敏的错误分类、发生阶段、版本和复现步骤即可。完整节点链接、生成的 Xray JSON 和用户 profile 都可能含敏感信息。
+2026-11-22 已在 Windows x64 验收 0.3.0。本版关闭内置 Google 服务，拦截已知服务域名，保留官方 CEF 渲染内核。固定依赖为 CEF `150.0.24`（Chromium `150.0.7871.289`）和 libXray `26.10.31`。
 
-## 本地构建和验证
+- 本地成品是 `dist/TunnelBrowser-Windows-x64-0.3.0.zip`，含 25 个文件，共 167,837,633 字节。包及配套的 `.zip.sha256` 由构建脚本生成。
+- 本地成品 SHA-256 为 `e61e43678a719f09a16f88aaadbf6b4f8d8cdba31f32624f7172b07a4d88278d`。
+- Git 交接包含源码、测试、依赖清单和构建脚本。ZIP、已下载依赖与本机构建产物通过 `.gitignore` 排除。
 
-旧基线 `ebad1c85` 在干净 PowerShell 5.1 下用 ComSpec 引号拼接导入 vcvars；VS 路径含空格时，cmd 把命令解析为 `'""C:\Program'`，报“不是内部或外部命令”，随后 CMake 找不到编译器。已预载工具链的成功构建不能证明该基线可在干净 PowerShell 5.1 直接复现。
+## 源码与数据
 
-修复前可在 cmd 中先 `call "<VS安装目录>\VC\Auxiliary\Build\vcvars64.bat"`，再从同一 cmd 启动 PowerShell 运行构建；或从“x64 Native Tools Command Prompt”运行 `tools\build.ps1`。已有 `cl.exe` 在 PATH 时会跳过导入。
+| 模块 | 入口 |
+| --- | --- |
+| 浏览器生命周期、设置面板、CEF 网络策略和代理状态 | [src/app.cc](src/app.cc) |
+| Google 浏览器服务域名清单 | [src/service_domains.h](src/service_domains.h) |
+| 分享链接解析、REALITY 配置 | [src/node.cc](src/node.cc) |
+| 浏览资料持久化和清理 | [src/profile.cc](src/profile.cc) |
+| 内核版本、下载摘要及运行文件清单 | [runtime.json](runtime.json) |
+| 依赖获取、Windows 构建、出包 | [tools/fetch-deps.py](tools/fetch-deps.py)、[tools/build.ps1](tools/build.ps1)、[tools/package.py](tools/package.py) |
 
-本次修复用临时 `.cmd` 调用 vcvars 后执行 `set`，导入当前进程环境，用完删除临时文件。修复后干净 PowerShell 5.1 可直接运行下列命令，完整构建待 Windows 测试机验收：
+用户数据在 `%LOCALAPPDATA%\TunnelBrowser`。继续使用既有 `profile/`，二次启动通过同一 request context 打开新窗口。CEF 还会创建 `Default/`，清理时一并覆盖它和旧版的 `global/`。清理保留由 DPAPI 保护的节点。故障记录只提交错误阶段、版本和复现信息。
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build.ps1
-```
-
-聚焦导入测试无需下载依赖，在 Windows PowerShell 5.1 运行：
+## 重新构建
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\test_vcvars_import.ps1
-```
-
-在 Windows x64 上准备 VS 2022 C++ x64 Build Tools、Windows SDK、CMake、Ninja 和 Python。构建需要 Python 3.11+，打正式发布包固定用 Python 3.14.3。脚本可在 x64 Native Tools 环境运行，也可用 `vswhere` 寻找已安装的工具链。原机 `downloads/` 下的便携工具链是本地缓存。
-
-在项目根目录依次执行下列命令。
-
-```powershell
-# 下载或核对缓存，构建 Release 并运行自检
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build.ps1
-
-# 单独重跑 DLL、解析和 profile 自检
-.\build\app\bootstrapc.exe --module=TunnelBrowser --self-test
-
-# 在同一个 Python 环境准备 cryptography，再运行回环集成
-python -m pip install cryptography
+python -m unittest discover -s tools -p "test_*.py" -v
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build.ps1 -Test -Package
 python .\tests\local_reality.py
-
-# 验收通过后，生成 ZIP 和 SHA-256 文件
-python .\tools\package.py
 python .\tests\package_check.py
 ```
 
-- [fetch-deps.py](tools/fetch-deps.py) 固定并校验 CEF `150.0.23+g4ccc4ca+chromium-150.0.7871.287` 和 libXray `v26.10.31` 的 Windows x64 归档。首次构建需访问 CEF 下载站、GitHub Release 和许可证文件地址。
-- [CMakeLists.txt](CMakeLists.txt) 生成 `build/app/TunnelBrowser.dll`，复制 CEF 运行库和资源，并把官方沙箱启动器复制为 `TunnelBrowser.exe`。自检通过原名 `bootstrapc.exe` 加 `--module=TunnelBrowser` 调用客户端 DLL。
-- [local_reality.py](tests/local_reality.py) 启动回环 HTTP fixture 和 REALITY/Vision 服务端，用临时节点和独立数据目录运行三次浏览器。预期输出 `PASS: proxy`、两次 `PASS: direct` 和总结。失败时优先看 `%TEMP%\tunnel-browser-test-*` 中本次运行目录的 `result.json`（若已生成）、`environments.json` 和两侧日志。测试生成的 fixture 也包含临时节点信息。
-- [package.py](tools/package.py) 将应用运行文件、CEF 资源和第三方许可证直接写入 ZIP。[包检查](tests/package_check.py) 验证 ZIP 和 SHA-256，检查运行文件、日志及应用 DLL 的本机路径。更改发布版本时同步更新脚本内的 ZIP 名和 README。
+- 构建要求 Python 3.11.4+，打正式包使用 Python 3.14.3。回环前在同一 Python 环境运行 `python -m pip install cryptography`。PowerShell 5.1 用 ASCII 批处理和进程环境传路径，cmd 以 UTF-16LE 导回环境变量。
+- `build/test` 包含原生自检和回环入口，`build/app` 用于发行。出包器按清单收集文件，校验包内 CEF 与编译所用 SDK 一致，并固定 ZIP 条目的顺序、时间和权限。
+- 回环使用独立的 `browser-data` 及临时节点。失败时查看 `%TEMP%\tunnel-browser-test-*\result.json`、同目录的 `environments.json` 和服务端日志。测试日志和资料目录留在本机。
 
-## 源码入口和必须保持的行为
+## 已验收与待验证
 
-| 改动范围 | 从哪里读 |
+| 验收项 | 结果 |
 | --- | --- |
-| 进程生命周期、原生多标签、设置入口 | [src/app.cc](src/app.cc) 的 `Run`、`App`、`BrowserClient`、`PanelProc` |
-| 节点导入、代理启停、切换时的网络控制 | [src/node.cc](src/node.cc) 的 `ParseNode`、`MakeConfig`，以及 `app.cc` 的 `Core`、`BeginConnect`、`Disconnect`、`FinishSwitch`、`ProxyPolicy`、`Traffic` |
-| 持久化、清空 profile、环境参数 | [src/profile.cc](src/profile.cc) 的 `LoadProfile`、`SaveProfile`、`ResetProfileData`，以及 `BrowserClient::OnAfterCreated`、`OnDevToolsMethodResult` |
+| Windows 构建、原生自检与脚本测试 | 中文路径下的 PowerShell 5.1 构建通过。23 项原生自检、5 项 Python 测试和 3 个工具链场景通过。 |
+| 本地 REALITY 回环 | 代理、直连和重启直连均通过。验证了代理故障阻断、主动恢复直连、原生标签、GET 和 POST 弹窗及 Cookie 跨重启保留。回环网络日志未记录发往 Google 服务的请求。 |
+| 解压后的发行包 | 包完整性、运行文件清单和正式 DLL 检查通过。使用隔离资料验证了启动、二次打开和跨窗口读取同一站点数据。相同构建输入的重复打包字节一致。 |
+| 公网和长期运行 | 真实节点、IPv6、DNS 和 WebRTC、持续连接和下载、长时间运行仍待验收。可复现编译需在同一 Windows 测试机上固定 Python、MSVC、SDK、CMake 和 Ninja，从干净工作区做两次完整构建并比较 EXE、DLL 和 ZIP 的 SHA-256。 |
 
-### 网络和代理
+若通过远程桌面连接 Windows 测试机，关闭自动重连，并在启动日志中标明执行者与任务。更新 CEF 后重做回环、语言资源与发行文件清单检查。
 
-- 每次启动是黄色 `Direct`。保存节点只记住配置。设置面板的“启用 VLESS”把状态切到 `Switching`，暂停请求、停止当前加载并关闭旧连接。worker 完成核心启停后，通过 Win32 消息让 UI 线程应用 CEF 代理配置。等待各 request context 的连接关闭回调后才恢复请求。
-- 代理路径是 `Chromium → 127.0.0.1 的 SOCKS5 → 进程内 libXray → VLESS / RAW / REALITY / Vision`。SOCKS 只绑定回环且禁用 UDP。应用从严格校验过的分享链接生成配置，只有 VLESS 出口。CEF 代理规则使用固定 SOCKS、移除隐式回环旁路且无直连回退。普通直连需要正常 DNS，fixture 的回环解析限制只在测试模式使用。
-- 绿色 `Proxy` 表示核心已启动且规则已应用，实际节点可达性还需要发请求验证。核心启动、停止或策略应用失败，以及 CEF 报本地代理连接失败，会进入红色 `Blocked`。用户主动关闭 VLESS 才恢复黄色直连。单个远端站点超时或握手失败可能仍显示绿色。
-- libXray 使用 `CGoInvoke` / `CGoFree` 和 API v3。由 DLL 释放返回缓冲，复用同一个已加载模块执行 `runXray` / `stopXray`。替换 DLL 前要完全退出浏览器，进程内的核心故障可能影响浏览器主进程。运行包内只有库，没有独立 `xray.exe`。
-- **CEF 150 已踩坑**。调用 `CloseAllConnections` 必须传有效的引用计数回调。内部会调用它，传空曾触发 `libcef.dll` 访问冲突 `0xc0000005`。涉及多标签时，用 `IsSharingWith` 判断 request context 是否共享存储。
+## 必须保持的行为
 
-### 单一 profile
-
-| 路径相对于 `%LOCALAPPDATA%\TunnelBrowser` | 内容 |
-| --- | --- |
-| `profile/`、`global/`、`Local State` | CEF 浏览数据和全局状态 |
-| `fingerprint.json` | schema v1，保存内部 ID、语言列表、IANA 时区和报告屏幕宽高 |
-| `node.dat` | Windows 当前用户 DPAPI 保护的节点链接，换 Windows 用户时应重新导入 |
-
-- 所有标签页和窗口共享一个 profile。语言同时应用到请求和页面环境。locale、时区和报告屏幕尺寸在每个标签页通过 Chromium DevTools Emulation 设置，首次主框架 HTTP(S) 导航等待三项调用确认。设置保存后，完全退出再启动生效。
-- “清空当前 profile”需用户确认。先关闭标签页并完成 `CefShutdown`，再清理固定的 profile 文件和目录。保留 `node.dat`，重启时生成新内部 ID。清理前会验证目标路径归属。损坏的环境参数文件会保留并提示启动失败，排障时先备份并检查 `fingerprint.json`。
-
-## 验收基线和后续范围
-
-### 安装包一致性验收
-
-正式安装包只在 Windows 上打。同一台机器、同一套工具链（同一 Python 版本、同一 VS/CMake/Ninja）打两次，exe、dll 和 ZIP 必须逐字节一致（SHA-256 相同）。
-
-在其他平台（如 Linux）打出的 ZIP 只要求包内文件一致：条目数、文件名、顺序、CRC、原始大小、日期和文件属性相同。压缩后大小可以不同（不同平台 Python 的 zlib 不同），不算缺陷。
-
-### Windows 测试机远程桌面
-
-- 连接时不得使用 `+auto-reconnect`，不开自动重连。
-- 每个启动远程桌面的脚本都要在日志开头写明由谁（哪个 Bot/人）为哪个任务启动。
-
-### 验收记录和后续范围
-
-- 0.2 发布时通过 21 项原生自检。回环集成通过完整 REALITY/Vision 请求链路，并从服务端访问日志确认流量实际经过代理。覆盖了核心故障时请求失败、主动关闭后恢复直连、原生新标签、黄绿状态、页面和同源 iframe 环境参数，以及重启后 Cookie 和 localStorage 持久化。出包时检查了 ZIP 完整性、运行库哈希和 `xray.exe` 缺席。
-- 2026-11-08 交接时，用现有构建重跑了 21 项自检及三个集成场景，均通过。回环 HTTP fixture 记录了一次 `WinError 10053`（连接被中止），测试最终退出码为 0。重新计算的 ZIP 哈希与发布记录一致。
-- 首次接手后建议先运行上述自检和集成，再用获授权的真实节点验收。优先检查断网与恢复、节点切换和退出，同时分别验证 DNS、IPv6、WebRTC、WebSocket 和下载行为。回环结果只覆盖 fixture；真实节点、完整旁路审计、长期稳定性和完整视觉验收尚未完成。
-- 用户本阶段选择先做浏览体验和环境参数。Canvas、WebGL、音频和字体属于后续工作，Worker 和跨进程 iframe 的环境覆盖仍需测试。内部 profile ID 的轮换与网页可见的硬件指纹无关。
-- 升级时核对 [THIRD_PARTY.md](THIRD_PARTY.md) 的上游版本和许可。CEF 版本同时在 CMake 和下载脚本固定。libXray 升级要重新验证 C ABI、版本自检、配置 schema 与核心启停，并重跑回环集成。早期 [Xray 调研](research/xray-integration-evidence.md) 可用于追溯设计和上游实现，其中的“未构建”描述的是调研阶段。
+- 应用打开的窗口先设置时区与屏幕尺寸，再访问启动网址。原生弹窗保留原始导航与请求体。当前 CEF 在原生弹窗里可能仍报告系统屏幕尺寸，回环测试分别验证了弹窗的导航、语言及时区。
+- 切换时使用保留的本地拒绝端口和请求门禁。已打开的网页卸载后等连接关闭，最后应用新线路并重开页面。失败进入红色阻断状态。只有用户选择关闭 VLESS 才切回直连。
+- 本地 SOCKS 绑定回环，禁用 UDP，无直连回退。每次启用重新选择端口。会话代数用于忽略上次代理的晚到错误。
+- 维护 CEF 启动 flags、每个浏览上下文的偏好、CEF 请求过滤和 libXray 出站规则。禁用 Google 浏览器服务的验证范围是当前构建的集成及已知域名，操作系统的 DNS、其他程序或用户访问的网站各自运行。
+- CEF 150 的 `CloseAllConnections` 须传有效回调。libXray 是 Go DLL，模块在进程退出时由系统回收。分发时保留 [第三方归属](THIRD_PARTY.md) 和随包通知。

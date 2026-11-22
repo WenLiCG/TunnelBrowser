@@ -12,8 +12,10 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <set>
 #include <charconv>
 #include <thread>
+#include <utility>
 #include <vector>
 #include "include/cef_app.h"
 #include "include/cef_browser.h"
@@ -29,33 +31,51 @@
 #include "include/wrapper/cef_closure_task.h"
 #include "node.h"
 #include "profile.h"
+#include "service_domains.h"
 
 namespace {
 enum class Mode { Direct, Switching, Proxy, Blocked };
 std::atomic<Mode> mode{Mode::Direct};
+std::atomic<unsigned> route_generation{0};
 bool ProxyEnabled() { return mode == Mode::Proxy; }
 bool CanBrowse() { return mode == Mode::Direct || mode == Mode::Proxy; }
+void ChangeMode(Mode next) { mode = next; ++route_generation; }
 Profile profile;
 std::filesystem::path app_dir, data_dir;
-HWND panel = nullptr, link_edit = nullptr, home_edit = nullptr, status_label = nullptr;
-HWND connect_button = nullptr, open_button = nullptr, disconnect_button = nullptr;
+std::string startup_url = "about:blank";
+HWND panel = nullptr, link_edit = nullptr, status_label = nullptr;
+HWND connect_button = nullptr, disconnect_button = nullptr;
 HWND language_edit = nullptr, timezone_edit = nullptr, width_edit = nullptr, height_edit = nullptr;
 HBRUSH state_brush = nullptr;
+HFONT panel_font = nullptr;
+std::vector<std::pair<HWND, CefRect>> panel_controls;
 std::thread worker;
 bool busy = false, closing = false, reset_requested = false;
-int proxy_port = 0;
+bool startup_failed = false;
+SOCKET blocked_socket = INVALID_SOCKET;
+int blocked_port = 0, proxy_port = 0;
+std::map<int, std::string> paused_pages;
+std::set<int> unloading;
+std::optional<Mode> switch_target;
+std::wstring switch_status;
+#ifdef TB_TESTING
 int smoke_stage = 0, smoke_result = 1;
 int smoke_first_browser = 0;
 bool smoke_green = false, smoke_yellow = false;
 std::string smoke_scenario = "proxy";
 std::string smoke_link, smoke_url;
 std::filesystem::path smoke_report;
+void SmokeStep(const char* step) {
+  if (!smoke_report.empty()) std::ofstream(smoke_report.parent_path() / L"steps.txt", std::ios::app) << step << '\n';
+}
+#endif
 CefRefPtr<CefRequestContext> context;
 std::vector<CefRefPtr<CefBrowser>> browsers;
 std::vector<CefRefPtr<CefRequestContext>> request_contexts;
 std::vector<std::string> languages{"zh-CN,zh,en-US,en", "en-US,en", "en-GB,en", "ja-JP,ja,en-US,en", "de-DE,de,en-US,en", "fr-FR,fr,en-US,en"};
 std::vector<std::string> timezones{"Asia/Shanghai", "Asia/Tokyo", "Asia/Singapore", "America/Los_Angeles", "America/New_York", "Europe/London", "Europe/Berlin", "Europe/Paris", "UTC"};
 constexpr UINT kComplete = WM_APP + 1;
+constexpr char kNewTabPage[] = "data:text/html,%3Ctitle%3ENew%20Tab%3C/title%3E";
 
 std::wstring Wide(const std::string& value) { return CefString(value).ToWString(); }
 std::string Utf8(const std::wstring& value) { return CefString(value).ToString(); }
@@ -68,7 +88,6 @@ void Status(const std::wstring& text) { SetWindowTextW(status_label, text.c_str(
 void Buttons() {
   EnableWindow(connect_button, !busy && !closing && !ProxyEnabled());
   EnableWindow(link_edit, !busy && !ProxyEnabled() && !closing);
-  EnableWindow(open_button, !busy && CanBrowse() && !closing);
   EnableWindow(disconnect_button, !busy && mode != Mode::Direct && !closing);
 }
 cef_color_t ModeColor() {
@@ -88,10 +107,6 @@ void UpdateAppearance() {
   auto color = mode == Mode::Proxy ? RGB(220, 241, 222) : mode == Mode::Blocked ? RGB(251, 221, 218) : RGB(255, 241, 184);
   state_brush = CreateSolidBrush(color);
   if (panel) { SetWindowTextW(panel, (L"Tunnel Browser · " + ModeText()).c_str()); InvalidateRect(status_label, nullptr, TRUE); }
-  for (const auto& browser : browsers) {
-    auto hwnd = GetAncestor(browser->GetHost()->GetWindowHandle(), GA_ROOT);
-    SetWindowTextW(hwnd, (L"Tunnel Browser · " + ModeText()).c_str());
-  }
   Buttons();
 }
 
@@ -157,129 +172,205 @@ std::string LoadLink() {
   if (encrypted.size() > 32768 || !Protect(encrypted, plain, true)) return "";
   return plain;
 }
-int FreePort() {
+int FreePort(SOCKET* reservation = nullptr) {
   SOCKET socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (socket == INVALID_SOCKET) return 0;
+  BOOL exclusive = TRUE;
   sockaddr_in address{}; address.sin_family = AF_INET;
   address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   int size = sizeof(address);
   int port = 0;
-  if (bind(socket, reinterpret_cast<sockaddr*>(&address), size) == 0 &&
+  if (setsockopt(socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive), sizeof(exclusive)) == 0 &&
+      bind(socket, reinterpret_cast<sockaddr*>(&address), size) == 0 &&
       getsockname(socket, reinterpret_cast<sockaddr*>(&address), &size) == 0) port = ntohs(address.sin_port);
-  closesocket(socket);
+  if (port && reservation) *reservation = socket;
+  else closesocket(socket);
   return port;
 }
 std::wstring policy_error;
 bool SetPref(CefRefPtr<CefPreferenceManager> target, const std::string& name, CefRefPtr<CefValue> value) {
   CefString error;
   if (target->SetPreference(name, value, error)) return true;
+  auto current = target->GetPreference(name);
+  if (current && current->IsEqual(value)) return true;
   policy_error = L"无法设置必需的网络策略：" + Wide(name);
   return false;
 }
-bool ProxyPolicy(CefRefPtr<CefRequestContext> target, bool proxy) {
+bool ProxyPolicy(CefRefPtr<CefRequestContext> target, Mode next) {
   auto settings = CefDictionaryValue::Create();
-  settings->SetString("mode", proxy ? "fixed_servers" : "direct");
-  if (proxy) {
-    settings->SetString("server", "socks5://127.0.0.1:" + std::to_string(proxy_port));
+  settings->SetString("mode", next == Mode::Direct ? "direct" : "fixed_servers");
+  if (next != Mode::Direct) {
+    if (!blocked_port) blocked_port = FreePort(&blocked_socket);
+    if (!blocked_port) { policy_error = L"无法保留本地阻断端口。"; return false; }
+    settings->SetString("server", "socks5://127.0.0.1:" + std::to_string(next == Mode::Proxy ? proxy_port : blocked_port));
     settings->SetString("bypass_list", "<-loopback>");
   }
   auto value = CefValue::Create(); value->SetDictionary(settings);
-  if (!SetPref(target, "proxy", value)) return false;
+  return SetPref(target, "proxy", value);
+}
+bool ConfigureProfile(CefRefPtr<CefRequestContext> target) {
+  auto off = CefValue::Create(); off->SetBool(false);
+  for (auto name : {"search.suggest_enabled", "translate.enabled", "safebrowsing.enabled",
+                    "safebrowsing.enhanced", "browser.enable_spellchecking", "spellcheck.use_spelling_service"}) {
+    if (!SetPref(target, name, off)) return false;
+  }
+  auto search = CefDictionaryValue::Create();
+  search->SetString("short_name", "DuckDuckGo"); search->SetString("keyword", "duckduckgo.com");
+  search->SetString("url", "https://duckduckgo.com/?q={searchTerms}");
+  auto provider = CefValue::Create(); provider->SetDictionary(search);
+  if (!SetPref(target, "default_search_provider_data.template_url_data", provider)) return false;
+  auto blank = CefValue::Create(); blank->SetString(kNewTabPage);
+  if (!SetPref(target, "newtab_page_location_override", blank)) return false;
   auto rtc = CefValue::Create(); rtc->SetString("disable_non_proxied_udp");
   if (!SetPref(target, "webrtc.ip_handling_policy", rtc)) return false;
   auto predict = CefValue::Create(); predict->SetInt(2);
   if (!SetPref(target, "net.network_prediction_options", predict)) return false;
   auto lang = CefValue::Create(); lang->SetString(profile.languages);
   if (!SetPref(target, "intl.accept_languages", lang)) return false;
-  auto doh = CefValue::Create(); doh->SetString("off");
-  return SetPref(CefPreferenceManager::GetGlobalPreferenceManager(), "dns_over_https.mode", doh);
+  return true;
 }
 
 void CreatePanel();
-class Traffic : public CefRequestContextHandler, public CefResourceRequestHandler {
+void BlockTraffic(const std::wstring& reason);
+void MainFrameUnloaded(int browser_id);
+#ifdef TB_TESTING
+void SmokeDone(bool success);
+#endif
+
+struct Environment {
+  int pending = 2;
+  bool failed = false;
+  CefRefPtr<CefRegistration> registration;
+};
+std::map<int, Environment> environments;
+
+class ResourceGate : public CefResourceRequestHandler {
+ public:
+  explicit ResourceGate(unsigned generation) : generation_(generation) {}
+  ReturnValue OnBeforeResourceLoad(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, CefRefPtr<CefRequest> request,
+      CefRefPtr<CefCallback>) override {
+    CefURLParts parts;
+    if (!CefParseURL(request->GetURL(), parts)) return RV_CONTINUE;
+    auto scheme = CefString(&parts.scheme).ToString();
+    if (scheme != "http" && scheme != "https" && scheme != "ws" && scheme != "wss") return RV_CONTINUE;
+    return CanBrowse() && generation_ == route_generation && !ServiceDomain(CefString(&parts.host).ToString())
+      ? RV_CONTINUE : RV_CANCEL;
+  }
+  void OnResourceLoadComplete(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, CefRefPtr<CefRequest>,
+      CefRefPtr<CefResponse> response, URLRequestStatus status, int64_t) override {
+    if (status != UR_FAILED || !response || response->GetError() != ERR_PROXY_CONNECTION_FAILED || !ProxyEnabled()) return;
+    auto generation = generation_;
+    CefPostTask(TID_UI, base::BindOnce([](unsigned generation) {
+      if (ProxyEnabled() && generation == route_generation)
+        BlockTraffic(L"本机代理不可用，已阻断联网。请重新启用 VLESS，或主动关闭 VLESS 恢复直连。");
+    }, generation));
+  }
+ private:
+  const unsigned generation_;
+  IMPLEMENT_REFCOUNTING(ResourceGate);
+};
+
+void StartupError() {
+  startup_failed = true;
+  closing = true;
+  ChangeMode(Mode::Blocked);
+#ifdef TB_TESTING
+  if (!smoke_report.empty()) {
+    std::ofstream report(smoke_report);
+    report << "{\"success\":false,\"policy_error\":" << JsonString(Utf8(policy_error)) << "}";
+  } else
+#endif
+    MessageBoxW(nullptr, policy_error.c_str(), L"Tunnel Browser", MB_ICONERROR);
+  if (panel) PostMessageW(panel, WM_CLOSE, 0, 0);
+  else CefQuitMessageLoop();
+}
+
+class Traffic : public CefRequestContextHandler {
  public:
   void OnRequestContextInitialized(CefRefPtr<CefRequestContext> target) override {
     request_contexts.push_back(target);
-    if (!ProxyPolicy(target, mode != Mode::Direct)) {
-      mode = Mode::Blocked;
-      if (!smoke_report.empty()) { std::ofstream report(smoke_report); report << "{\"success\":false,\"policy_error\":" << JsonString(Utf8(policy_error)) << "}"; }
-      if (smoke_report.empty()) MessageBoxW(nullptr, policy_error.c_str(), L"Tunnel Browser", MB_ICONERROR);
-      if (panel) PostMessageW(panel, WM_CLOSE, 0, 0);
-      else CefQuitMessageLoop();
+    if (!ProxyPolicy(target, mode) || !ConfigureProfile(target)) {
+      StartupError();
       return;
     }
-    if (!panel && !closing) CreatePanel();
+    if (!panel && !closing && context && target->IsSame(context)) CreatePanel();
     UpdateAppearance();
   }
   CefRefPtr<CefResourceRequestHandler> GetResourceRequestHandler(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>,
-      CefRefPtr<CefRequest>, bool, bool, const CefString&, bool&) override { return this; }
-  ReturnValue OnBeforeResourceLoad(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, CefRefPtr<CefRequest>,
-      CefRefPtr<CefCallback>) override { return CanBrowse() ? RV_CONTINUE : RV_CANCEL; }
+      CefRefPtr<CefRequest>, bool, bool, const CefString&, bool&) override { return new ResourceGate(route_generation); }
  private:
   IMPLEMENT_REFCOUNTING(Traffic);
 };
 
 void FinishClose();
-void SmokeDone(bool success);
-void OpenBrowser();
+void OpenBrowser(std::string url = "about:blank");
 void Disconnect();
 void ShowSettings() { ShowWindow(panel, SW_SHOW); ShowWindow(panel, SW_RESTORE); SetForegroundWindow(panel); }
+#ifdef TB_TESTING
 class OfflineProbe : public CefCompletionCallback {
  public:
   explicit OfflineProbe(CefRefPtr<CefBrowser> browser) : browser_(browser) {}
-  void OnComplete() override { browser_->GetMainFrame()->LoadURL(smoke_url + "?offline-check"); }
+  void OnComplete() override {
+    if (browser_->IsValid()) browser_->GetMainFrame()->ExecuteJavaScript("fetch('/?offline-check').catch(() => {})", {}, 0);
+  }
  private:
   CefRefPtr<CefBrowser> browser_;
   IMPLEMENT_REFCOUNTING(OfflineProbe);
 };
+#endif
 class BrowserClient : public CefClient, public CefLifeSpanHandler, public CefContextMenuHandler,
-                      public CefDisplayHandler, public CefLoadHandler, public CefRequestHandler,
+                      public CefLoadHandler, public CefRequestHandler,
+#ifdef TB_TESTING
+                      public CefDisplayHandler,
+#endif
                       public CefCommandHandler, public CefDevToolsMessageObserver {
  public:
-  explicit BrowserClient(std::string first_url = "") : first_url_(std::move(first_url)) {}
+  explicit BrowserClient(std::string first_url = {}) : first_url_(std::move(first_url)) {}
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
   CefRefPtr<CefContextMenuHandler> GetContextMenuHandler() override { return this; }
+#ifdef TB_TESTING
   CefRefPtr<CefDisplayHandler> GetDisplayHandler() override { return this; }
+#endif
   CefRefPtr<CefLoadHandler> GetLoadHandler() override { return this; }
   CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
   CefRefPtr<CefCommandHandler> GetCommandHandler() override { return this; }
-  bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefRefPtr<CefRequest> request, bool, bool) override {
+  bool OnBeforeBrowse(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, CefRefPtr<CefRequest> request, bool, bool) override {
     auto url = request->GetURL().ToString();
     if (url.starts_with("chrome://settings") || url.starts_with("chrome://profile")) { ShowSettings(); return true; }
-    auto& env = environments_[browser->GetIdentifier()];
-    if (frame->IsMain() && !env.ready && (url.starts_with("http://") || url.starts_with("https://"))) {
-      env.pending_request = request; return true;
-    }
-    return false;
+    for (std::string_view internal : {"chrome://extensions", "chrome://webstore", "chrome://chrome-signin", "chrome://signin",
+                                    "chrome://password-manager", "chrome://sync", "chrome://flags", "chrome://components"})
+      if (url.starts_with(internal)) return true;
+    return url.starts_with("chrome-extension://");
   }
   bool OnChromeCommand(CefRefPtr<CefBrowser>, int command, cef_window_open_disposition_t) override {
     if (command == cef_id_for_command_id_name("IDC_OPTIONS")) { ShowSettings(); return true; }
-    return SingleProfileCommand(command);
+    if (command == cef_id_for_command_id_name("IDC_NEW_WINDOW")) { if (CanBrowse()) OpenBrowser(); else ShowSettings(); return true; }
+    return RemovedCommand(command);
   }
-  bool IsChromeAppMenuItemVisible(CefRefPtr<CefBrowser>, int command) override { return !SingleProfileCommand(command); }
+  bool IsChromeAppMenuItemVisible(CefRefPtr<CefBrowser>, int command) override { return !RemovedCommand(command); }
   bool IsChromeToolbarButtonVisible(cef_chrome_toolbar_button_type_t type) override { return type != CEF_CTBT_AVATAR; }
-  void OnDevToolsMethodResult(CefRefPtr<CefBrowser> browser, int id, bool success, const void*, size_t) override {
-    if (id < 10001 || id > 10003) return;
-    auto it = environments_.find(browser->GetIdentifier());
-    if (it == environments_.end()) return;
+  void OnDevToolsMethodResult(CefRefPtr<CefBrowser> browser, int id, bool success, const void* result, size_t size) override {
+    if (id != 10001 && id != 10002) return;
+    auto it = environments.find(browser->GetIdentifier());
+    if (it == environments.end()) return;
     auto& env = it->second;
+    // Same-origin tabs can share the renderer and its timezone override.
+    if (!success && id == 10001 && result &&
+        std::string_view(static_cast<const char*>(result), size).find("Timezone override is already in effect") != std::string_view::npos)
+      success = true;
     env.failed = env.failed || !success;
-    if (--env.pending != 0) return;
-    if (env.failed) {
-      Status(L"环境参数应用失败。请检查时区等设置，保存后重新启动浏览器。"); ShowSettings();
-      if (smoke_stage) SmokeDone(false);
-      return;
+    if (--env.pending == 0) {
+#ifdef TB_TESTING
+      SmokeStep(env.failed ? "environment failed" : "environment ready");
+      if (!env.failed && smoke_stage == 5 && browser->GetIdentifier() != smoke_first_browser)
+        browser->GetMainFrame()->LoadURL(smoke_url + "?tab2");
+#endif
+      if (!env.failed && CanBrowse() && !first_url_.empty()) browser->GetMainFrame()->LoadURL(std::exchange(first_url_, {}));
     }
-    env.ready = true;
-    if (env.pending_request) {
-      auto request = env.pending_request; env.pending_request = nullptr;
-      browser->GetMainFrame()->LoadRequest(request);
-    } else if (!env.initial_url.empty()) {
-      auto url = std::move(env.initial_url); browser->GetMainFrame()->LoadURL(url);
-    }
+    if (env.failed) EnvironmentError(env);
   }
+#ifdef TB_TESTING
   void OnTitleChange(CefRefPtr<CefBrowser> browser, const CefString& title) override {
-    SetWindowTextW(GetAncestor(browser->GetHost()->GetWindowHandle(), GA_ROOT), (title.ToWString() + L" · " + ModeText()).c_str());
     if (title != "TunnelBrowser Local Test") return;
     if (smoke_stage == 1) {
       smoke_green = ProxyEnabled() && context->GetChromeColorSchemeColor() == ModeColor();
@@ -294,7 +385,15 @@ class BrowserClient : public CefClient, public CefLifeSpanHandler, public CefCon
       smoke_first_browser = browser->GetIdentifier(); smoke_stage = 5;
       browser->GetHost()->ExecuteChromeCommand(cef_id_for_command_id_name("IDC_NEW_TAB"), CEF_WOD_NEW_FOREGROUND_TAB);
     } else if (smoke_stage == 5 && browser->GetIdentifier() != smoke_first_browser) {
-      SmokeDone(smoke_yellow && browsers.size() >= 2 && browser->GetHost()->GetRequestContext()->IsSharingWith(context));
+      smoke_stage = 8;
+      browser->GetMainFrame()->ExecuteJavaScript("window.open('/?popup-get', '_blank')", {}, 0);
+    } else if (smoke_stage == 8 && browser->GetMainFrame()->GetURL() == smoke_url + "?popup-get") {
+      smoke_stage = 9;
+      browser->GetMainFrame()->ExecuteJavaScript(
+        "const f = document.createElement('form'); f.method='post'; f.target='_blank'; f.action='/?popup-post';"
+        "const i = document.createElement('input'); i.name='check'; i.value='original'; f.append(i); document.body.append(f); f.submit();", {}, 0);
+    } else if (smoke_stage == 9 && browser->GetMainFrame()->GetURL() == smoke_url + "?popup-post") {
+      SmokeDone(smoke_yellow && browsers.size() >= 4 && browser->GetHost()->GetRequestContext()->IsSharingWith(context));
     } else if (smoke_stage == 6) {
       smoke_yellow = mode == Mode::Direct && context->GetChromeColorSchemeColor() == ModeColor();
       SmokeDone(smoke_green && smoke_yellow);
@@ -303,43 +402,50 @@ class BrowserClient : public CefClient, public CefLifeSpanHandler, public CefCon
   void OnLoadError(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> frame, ErrorCode error,
       const CefString&, const CefString&) override {
     if (frame->IsMain() && smoke_stage == 1) { std::ofstream log(smoke_report.parent_path() / L"browser-error.log"); log << static_cast<int>(error); }
-    if (frame->IsMain() && smoke_stage == 2) {
-      if (error != ERR_PROXY_CONNECTION_FAILED && error != ERR_SOCKS_CONNECTION_FAILED) { SmokeDone(false); return; }
-      mode = Mode::Blocked; UpdateAppearance(); smoke_stage = 6; Disconnect();
-    }
-    else if (!smoke_stage && ProxyEnabled() && (error == ERR_PROXY_CONNECTION_FAILED || error == ERR_SOCKS_CONNECTION_FAILED)) {
-      mode = Mode::Blocked; UpdateAppearance();
-      Status(L"本机代理不可用，已阻断联网。请重新启用 VLESS，或主动关闭 VLESS 恢复直连。");
-    }
+  }
+#endif
+  void OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, int) override {
+    if (frame->IsMain() && frame->GetURL() == "about:blank") MainFrameUnloaded(browser->GetIdentifier());
+  }
+  void OnLoadStart(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, TransitionType) override {
+    if (!frame->IsMain()) return;
+    // A native popup can acquire its renderer during the original navigation.
+    SetTimezone(browser->GetHost(), 10003);
+    SetMetrics(browser->GetHost(), 10004);
   }
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
+#ifdef TB_TESTING
+    SmokeStep("tab created");
+#endif
     browsers.push_back(browser);
-    auto& env = environments_[browser->GetIdentifier()];
-    env.initial_url = std::move(first_url_);
-    if (smoke_stage == 5 && browser->GetIdentifier() != smoke_first_browser) env.initial_url = smoke_url + "?tab2";
+    auto& env = environments[browser->GetIdentifier()];
     env.registration = browser->GetHost()->AddDevToolsMessageObserver(this);
-    auto zone = CefDictionaryValue::Create(); zone->SetString("timezoneId", profile.timezone);
-    auto locale = CefDictionaryValue::Create(); auto name = profile.languages.substr(0, profile.languages.find(','));
-    std::replace(name.begin(), name.end(), '-', '_'); locale->SetString("locale", name);
-    auto metrics = CefDictionaryValue::Create();
-    metrics->SetInt("width", 0); metrics->SetInt("height", 0); metrics->SetDouble("deviceScaleFactor", 0);
-    metrics->SetBool("mobile", false); metrics->SetInt("screenWidth", profile.screen_width); metrics->SetInt("screenHeight", profile.screen_height);
-    metrics->SetBool("dontSetVisibleSize", true);
-    browser->GetHost()->ExecuteDevToolsMethod(10001, "Emulation.setTimezoneOverride", zone);
-    browser->GetHost()->ExecuteDevToolsMethod(10002, "Emulation.setLocaleOverride", locale);
-    browser->GetHost()->ExecuteDevToolsMethod(10003, "Emulation.setDeviceMetricsOverride", metrics);
+    auto host = browser->GetHost();
+    if (!env.registration || !SetTimezone(host, 10001) || !SetMetrics(host, 10002)) EnvironmentError(env);
+    CefPostDelayedTask(TID_UI, base::BindOnce([](int id) {
+      auto it = environments.find(id);
+      if (it != environments.end() && it->second.pending > 0 && !it->second.failed) EnvironmentError(it->second);
+    }, browser->GetIdentifier()), 5000);
     UpdateAppearance();
     if (closing) browser->GetHost()->CloseBrowser(false);
   }
   bool DoClose(CefRefPtr<CefBrowser>) override { return false; }
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
     std::erase_if(browsers, [&](const auto& b) { return b->GetIdentifier() == browser->GetIdentifier(); });
-    environments_.erase(browser->GetIdentifier());
+    environments.erase(browser->GetIdentifier());
+    paused_pages.erase(browser->GetIdentifier());
     if (browsers.empty()) { closing = true; if (!busy) FinishClose(); }
+    else if (!closing) CefPostDelayedTask(TID_UI, base::BindOnce([] {
+      if (closing) return;
+      for (const auto& remaining : browsers) SetTimezone(remaining->GetHost(), 10003);
+    }), 200);
+    MainFrameUnloaded(browser->GetIdentifier());
   }
   void OnBeforeContextMenu(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, CefRefPtr<CefContextMenuParams>,
       CefRefPtr<CefMenuModel> model) override {
-    model->AddSeparator(); model->AddItem(MENU_ID_USER_FIRST, "代理与环境设置");
+    model->Remove(cef_id_for_command_id_name("IDC_CONTENT_CONTEXT_TRANSLATE"));
+    model->Remove(cef_id_for_command_id_name("IDC_CONTENT_CONTEXT_PARTIAL_TRANSLATE"));
+    model->AddSeparator(); model->AddItem(MENU_ID_USER_FIRST, L"代理与环境设置 · " + ModeText());
   }
   bool OnContextMenuCommand(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, CefRefPtr<CefContextMenuParams>,
       int id, EventFlags) override {
@@ -347,112 +453,208 @@ class BrowserClient : public CefClient, public CefLifeSpanHandler, public CefCon
     ShowSettings(); return true;
   }
  private:
-  struct Environment {
-    bool ready = false, failed = false;
-    int pending = 3;
-    std::string initial_url;
-    CefRefPtr<CefRequest> pending_request;
-    CefRefPtr<CefRegistration> registration;
-  };
-  static bool SingleProfileCommand(int id) {
-    for (auto name : {"IDC_NEW_INCOGNITO_WINDOW", "IDC_ADD_NEW_PROFILE", "IDC_MANAGE_CHROME_PROFILES", "IDC_SHOW_AVATAR_MENU"})
+  static bool SetTimezone(CefRefPtr<CefBrowserHost> host, int id) {
+    auto zone = CefDictionaryValue::Create(); zone->SetString("timezoneId", profile.timezone);
+    return host->ExecuteDevToolsMethod(id, "Emulation.setTimezoneOverride", zone) != 0;
+  }
+  static bool SetMetrics(CefRefPtr<CefBrowserHost> host, int id) {
+    auto metrics = CefDictionaryValue::Create();
+    metrics->SetInt("width", 0); metrics->SetInt("height", 0); metrics->SetDouble("deviceScaleFactor", 0);
+    metrics->SetBool("mobile", false); metrics->SetInt("screenWidth", profile.screen_width); metrics->SetInt("screenHeight", profile.screen_height);
+    metrics->SetBool("dontSetVisibleSize", true);
+    return host->ExecuteDevToolsMethod(id, "Emulation.setDeviceMetricsOverride", metrics) != 0;
+  }
+  static void EnvironmentError(Environment& env) {
+    env.failed = true;
+    Status(L"标签页环境参数应用失败。请检查设置，保存后重启浏览器。"); ShowSettings();
+#ifdef TB_TESTING
+    SmokeStep("environment unavailable");
+    if (smoke_stage) SmokeDone(false);
+#endif
+  }
+  static bool RemovedCommand(int id) {
+    for (auto name : {"IDC_NEW_INCOGNITO_WINDOW", "IDC_ADD_NEW_PROFILE", "IDC_MANAGE_CHROME_PROFILES", "IDC_SHOW_AVATAR_MENU",
+                      "IDC_MANAGE_GOOGLE_ACCOUNT", "IDC_SHOW_SIGNIN", "IDC_SHOW_SYNC_SETTINGS", "IDC_TURN_ON_SYNC",
+                      "IDC_SHOW_TRANSLATE", "IDC_SHOW_GOOGLE_LENS_SHORTCUT", "IDC_ROUTE_MEDIA", "IDC_SEND_TAB_TO_SELF",
+                      "IDC_MANAGE_EXTENSIONS", "IDC_EXTENSIONS_SUBMENU", "IDC_EXTENSIONS_SUBMENU_MANAGE_EXTENSIONS",
+                      "IDC_EXTENSIONS_SUBMENU_VISIT_CHROME_WEB_STORE", "IDC_SHOW_PASSWORD_MANAGER", "IDC_FEEDBACK"})
       if (id == cef_id_for_command_id_name(name)) return true;
     return false;
   }
-  std::map<int, Environment> environments_;
   std::string first_url_;
   IMPLEMENT_REFCOUNTING(BrowserClient);
 };
-void OpenBrowser() {
-  if (!CanBrowse() || closing) return;
-  auto url = Utf8(Text(home_edit));
+void OpenBrowser(std::string url) {
+  if (!CanBrowse() || closing || !context) return;
   CefURLParts parts;
-  if (!CefParseURL(url, parts) || (CefString(&parts.scheme) != "https" && CefString(&parts.scheme) != "http")) {
+  if (url != "about:blank" && (!CefParseURL(url, parts) || (CefString(&parts.scheme) != "https" && CefString(&parts.scheme) != "http"))) {
     Status(L"网址需要以 https:// 或 http:// 开头。"); return;
   }
   CefWindowInfo window; window.SetAsPopup(nullptr, L"Tunnel Browser");
   window.runtime_style = CEF_RUNTIME_STYLE_CHROME;
-  window.bounds = CefRect(80, 60, std::min(1280, profile.screen_width - 40), std::min(850, profile.screen_height - 80));
+  window.bounds = CefRect(80, 60, 1180, 800);
   CefBrowserSettings settings;
-  if (!CefBrowserHost::CreateBrowser(window, new BrowserClient(url), "about:blank", settings, nullptr, context)) {
+#ifdef TB_TESTING
+  SmokeStep("create browser");
+#endif
+  if (!CefBrowserHost::CreateBrowser(window, new BrowserClient(url == "about:blank" ? "" : url), "about:blank", settings, nullptr, context)) {
     Status(L"创建浏览器窗口失败。请退出后重试。");
   }
 }
 class ConnectionClosed : public CefCompletionCallback {
  public:
-  void OnComplete() override {}
+  explicit ConnectionClosed(base::OnceClosure complete = {}) : complete_(std::move(complete)) {}
+  void OnComplete() override { if (complete_) std::move(complete_).Run(); }
  private:
+  base::OnceClosure complete_;
   IMPLEMENT_REFCOUNTING(ConnectionClosed);
 };
-void DrainConnections() {
-  // CEF 150 dereferences this callback even though its API marks it optional.
-  for (const auto& target : request_contexts) target->CloseAllConnections(new ConnectionClosed());
+
+bool ApplyRoute(Mode target) {
+  bool applied = true;
+  for (const auto& c : request_contexts) {
+    if (!ProxyPolicy(c, target)) applied = false;
+  }
+  return applied;
 }
+void DrainConnections() {
+  // CEF 150 expects a valid callback even though the header marks it optional.
+  for (const auto& c : request_contexts) c->CloseAllConnections(new ConnectionClosed);
+}
+
+void UnloadPages() {
+  for (const auto& browser : browsers) {
+    browser->StopLoad();
+    auto frame = browser->GetMainFrame();
+    auto url = frame->GetURL().ToString();
+    if (!url.starts_with("http://") && !url.starts_with("https://")) continue;
+    int id = browser->GetIdentifier();
+    paused_pages.try_emplace(id, url);
+    unloading.insert(id);
+    frame->LoadURL("about:blank");
+  }
+}
+
+void BlockTraffic(const std::wstring& reason) {
+  ChangeMode(Mode::Blocked);
+  busy = false;
+  switch_target.reset();
+  bool blocked = ApplyRoute(Mode::Blocked);
+  DrainConnections();
+  UnloadPages();
+  UpdateAppearance();
+  Status(blocked ? reason : policy_error);
+  if (closing && browsers.empty()) { FinishClose(); return; }
+#ifdef TB_TESTING
+  if (smoke_stage == 2 && !browsers.empty()) {
+    smoke_stage = 7;
+    auto probe = browsers.front();
+    CefPostDelayedTask(TID_UI, base::BindOnce([](CefRefPtr<CefBrowser> tab) {
+      if (tab->IsValid()) tab->GetMainFrame()->LoadURL(smoke_url + "?blocked");
+    }, probe), 200);
+    CefPostDelayedTask(TID_UI, base::BindOnce([] {
+      if (smoke_stage != 7 || mode != Mode::Blocked) return;
+      smoke_stage = 6;
+      Disconnect();
+    }), 1000);
+  } else if (smoke_stage == 1) SmokeDone(false);
+#endif
+}
+
+bool PauseTraffic(const wchar_t* message) {
+  busy = true;
+  ChangeMode(Mode::Switching);
+  UpdateAppearance();
+  Status(message);
+  if (!ApplyRoute(Mode::Blocked)) { BlockTraffic(policy_error); return false; }
+  DrainConnections();
+  UnloadPages();
+  return true;
+}
+
 void BeginConnect() {
   if (busy || ProxyEnabled() || closing) return;
   auto link = Utf8(Text(link_edit));
+  if (link.empty()) link = LoadLink();
   std::string error;
   auto node = ParseNode(link, error);
   if (!node) { Status(Wide(error)); return; }
-  busy = true; mode = Mode::Switching; UpdateAppearance(); Status(L"正在启用 VLESS，网络请求暂时暂停……");
-  for (const auto& browser : browsers) browser->StopLoad();
-  DrainConnections();
-  auto config = MakeConfig(*node, proxy_port);
-  if (smoke_stage == 1) {
-    auto value = CefParseJSON(config, JSON_PARSER_RFC);
-    auto log = value->GetDictionary()->GetDictionary("log");
-    log->SetString("loglevel", "debug");
-    log->SetString("error", (smoke_report.parent_path() / L"client-debug.log").wstring());
-    config = CefWriteJSON(value, JSON_WRITER_DEFAULT);
-  }
-  worker = std::thread([link, config] {
-    bool success = core.Stop() && core.Start(config);
-    bool saved = success && SaveLink(link);
-    PostMessageW(panel, kComplete, success ? (saved ? 1 : 2) : 0, 0);
+  if (!PauseTraffic(L"正在启用 VLESS，当前网页将通过新线路重新打开……")) return;
+  worker = std::thread([link, node = std::move(*node)] {
+    int port = core.Stop() ? FreePort() : 0;
+    if (port && !core.Start(MakeConfig(node, port))) {
+      // A failed start leaves the next attempt free to choose another port.
+      port = 0;
+    }
+    bool saved = port && SaveLink(link);
+    PostMessageW(panel, kComplete, port ? (saved ? 1 : 2) : 0, port);
   });
 }
 void Disconnect() {
-  if (busy || mode == Mode::Direct) return;
-  mode = Mode::Switching; busy = true; UpdateAppearance();
-  for (const auto& browser : browsers) browser->StopLoad();
-  DrainConnections();
-  Status(L"正在关闭 VLESS，随后恢复直连……");
+  if (busy || mode == Mode::Direct || closing) return;
+  if (!PauseTraffic(L"正在关闭 VLESS，当前网页将通过直连重新打开……")) return;
   worker = std::thread([] { bool ok = core.Stop(); PostMessageW(panel, kComplete, ok ? 3 : 4, 0); });
 }
-class ModeReady : public CefCompletionCallback {
- public:
-  ModeReady(Mode next, std::shared_ptr<size_t> pending, std::wstring message)
-    : next_(next), pending_(pending), message_(std::move(message)) {}
-  void OnComplete() override {
-    if (--*pending_ != 0) return;
-    mode = next_; busy = false; UpdateAppearance(); Status(message_);
-    if (closing) { if (browsers.empty()) FinishClose(); return; }
-    if (smoke_stage == 1 && next_ == Mode::Proxy) OpenBrowser();
-    if (smoke_stage == 6 && next_ == Mode::Direct && !browsers.empty()) browsers.front()->GetMainFrame()->LoadURL(smoke_url + "?direct-after-disable");
-  }
- private:
-  Mode next_;
-  std::shared_ptr<size_t> pending_;
-  std::wstring message_;
-  IMPLEMENT_REFCOUNTING(ModeReady);
-};
-void FinishSwitch(Mode next, const std::wstring& message) {
-  for (const auto& target : request_contexts) {
-    if (!ProxyPolicy(target, next == Mode::Proxy)) {
-      mode = Mode::Blocked; busy = false; UpdateAppearance(); Status(policy_error); return;
-    }
-  }
+void ResumeTraffic() {
+  if (!switch_target || !unloading.empty()) return;
+  auto next = *switch_target;
+  switch_target.reset();
+  if (closing && browsers.empty()) { busy = false; FinishClose(); return; }
+  if (!ApplyRoute(next)) { BlockTraffic(policy_error); return; }
   auto pending = std::make_shared<size_t>(request_contexts.size());
-  for (const auto& target : request_contexts) target->CloseAllConnections(new ModeReady(next, pending, message));
+  auto generation = route_generation.load();
+  for (const auto& c : request_contexts) {
+    c->CloseAllConnections(new ConnectionClosed(base::BindOnce([](std::shared_ptr<size_t> pending, Mode next, unsigned generation) {
+      if (--*pending || generation != route_generation) return;
+      ChangeMode(next);
+      busy = false;
+      UpdateAppearance();
+      Status(switch_status);
+      if (closing) { if (browsers.empty()) FinishClose(); return; }
+#ifdef TB_TESTING
+      if (smoke_stage == 1 && next == Mode::Proxy) { OpenBrowser(smoke_url); return; }
+      if (smoke_stage == 6 && next == Mode::Direct && !browsers.empty()) {
+        paused_pages.clear();
+        browsers.front()->GetMainFrame()->LoadURL(smoke_url + "?direct-after-disable");
+        return;
+      }
+#endif
+      for (const auto& browser : browsers) {
+        auto page = paused_pages.find(browser->GetIdentifier());
+        if (page != paused_pages.end() && browser->GetMainFrame()->GetURL() == "about:blank")
+          browser->GetMainFrame()->LoadURL(page->second);
+      }
+      paused_pages.clear();
+    }, pending, next, generation)));
+  }
 }
+void MainFrameUnloaded(int browser_id) {
+  unloading.erase(browser_id);
+  ResumeTraffic();
+}
+void FinishSwitch(Mode next, const std::wstring& message) {
+#ifdef TB_TESTING
+  SmokeStep("apply route");
+#endif
+  switch_target = next;
+  switch_status = message;
+  ResumeTraffic();
+  auto generation = route_generation.load();
+  CefPostDelayedTask(TID_UI, base::BindOnce([](unsigned generation) {
+    if (busy && generation == route_generation)
+      BlockTraffic(L"关闭旧连接超时，已阻断联网。请关闭页面后重试。");
+  }, generation), 7000);
+}
+
 void FinishClose() {
   if (!browsers.empty() || busy) return;
-  mode = Mode::Blocked;
+  ChangeMode(Mode::Blocked);
   core.Stop();
   DestroyWindow(panel); panel = nullptr;
   context = nullptr;
   CefQuitMessageLoop();
 }
+#ifdef TB_TESTING
 void SmokeDone(bool success) {
   if (smoke_stage == 3 || smoke_report.empty()) return;
   smoke_stage = 3; smoke_result = success ? 0 : 1;
@@ -461,18 +663,18 @@ void SmokeDone(bool success) {
     << ",\"green\":" << (smoke_green ? "true" : "false") << ",\"yellow\":" << (smoke_yellow ? "true" : "false")
     << ",\"tabs\":" << browsers.size() << "}";
   report.close();
-  closing = true; mode = Mode::Blocked;
+  closing = true; ChangeMode(Mode::Blocked);
   auto copy = browsers;
   for (auto browser : copy) browser->GetHost()->CloseBrowser(true);
   if (browsers.empty()) FinishClose();
 }
+#endif
 LRESULT CALLBACK ControlKeys(HWND hwnd, UINT message, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) {
   if (message == WM_KEYDOWN && w == VK_TAB) {
     SetFocus(GetNextDlgTabItem(panel, hwnd, GetKeyState(VK_SHIFT) < 0)); return 0;
   }
   if (message == WM_KEYDOWN && w == VK_RETURN) {
     if (hwnd == link_edit) { BeginConnect(); return 0; }
-    if (hwnd == home_edit) { OpenBrowser(); return 0; }
     wchar_t kind[16]{}; GetClassNameW(hwnd, kind, 16);
     if (std::wstring(kind) == L"Button") { SendMessageW(hwnd, BM_CLICK, 0, 0); return 0; }
   }
@@ -499,12 +701,31 @@ void SaveEnvironment() {
 void ResetCurrentProfile() {
   if (busy) { Status(L"请等待网络切换完成后再清空 profile。"); return; }
   if (MessageBoxW(panel, L"将关闭全部标签页，清除当前 profile 的登录状态、Cookie、缓存、历史记录及环境参数。已保存的 VLESS 节点会保留。\n\n确定清空并退出？", L"清空当前 profile", MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) != IDYES) return;
-  reset_requested = true; closing = true; mode = Mode::Blocked;
+  reset_requested = true; closing = true; ChangeMode(Mode::Blocked);
   auto copy = browsers;
   for (const auto& browser : copy) browser->GetHost()->CloseBrowser(true);
   if (browsers.empty()) FinishClose();
 }
+void LayoutPanel(UINT dpi) {
+  NONCLIENTMETRICSW metrics{sizeof(metrics)};
+  HFONT font = SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi)
+    ? CreateFontIndirectW(&metrics.lfMessageFont) : nullptr;
+  auto scale = [dpi](int value) { return MulDiv(value, dpi, 96); };
+  for (const auto& [control, rect] : panel_controls) {
+    MoveWindow(control, scale(rect.x), scale(rect.y), scale(rect.width), scale(rect.height), TRUE);
+    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font ? font : GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+  }
+  if (panel_font) DeleteObject(panel_font);
+  panel_font = font;
+}
 LRESULT CALLBACK PanelProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
+  if (message == WM_DPICHANGED) {
+    auto* bounds = reinterpret_cast<const RECT*>(l);
+    SetWindowPos(hwnd, nullptr, bounds->left, bounds->top, bounds->right - bounds->left, bounds->bottom - bounds->top,
+                 SWP_NOACTIVATE | SWP_NOZORDER);
+    LayoutPanel(LOWORD(w));
+    return 0;
+  }
   if (message == WM_CTLCOLORSTATIC && reinterpret_cast<HWND>(l) == status_label && state_brush) {
     SetTextColor(reinterpret_cast<HDC>(w), RGB(30, 35, 30)); SetBkMode(reinterpret_cast<HDC>(w), TRANSPARENT);
     return reinterpret_cast<LRESULT>(state_brush);
@@ -512,7 +733,6 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
   if (message == WM_COMMAND) {
     switch (LOWORD(w)) {
       case 101: BeginConnect(); break;
-      case 102: OpenBrowser(); break;
       case 103: Disconnect(); break;
       case 104: SaveEnvironment(); break;
       case 105: ResetCurrentProfile(); break;
@@ -522,22 +742,18 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
   if (message == kComplete) {
     if (worker.joinable()) worker.join();
     if (w == 1 || w == 2) {
-      FinishSwitch(Mode::Proxy, w == 1 ? L"VLESS 已启用。现有连接已关闭；刷新网页即可使用代理。" : L"VLESS 已启用，但节点保存失败；退出后需重新导入。");
+      proxy_port = static_cast<int>(l);
+      if (w == 1) SetWindowTextW(link_edit, L"");
+      FinishSwitch(Mode::Proxy, w == 1 ? L"VLESS 已启用。" : L"VLESS 已启用，但节点保存失败；退出后需重新导入。");
       return 0;
-    } else if (w == 3) { FinishSwitch(Mode::Direct, L"VLESS 已关闭，当前为直连模式。刷新网页即可继续浏览。"); return 0; }
-    else {
-      busy = false; mode = Mode::Blocked; UpdateAppearance();
-      Status(w == 4 ? L"核心停止失败，联网已阻断。请退出后重试。" : L"VLESS 启动失败，联网已阻断。请检查节点，或关闭 VLESS 恢复直连。");
-    }
-    Buttons();
-    if (smoke_stage == 1 && w == 0) { SmokeDone(false); return 0; }
-    if (closing && browsers.empty()) FinishClose();
+    } else if (w == 3) { FinishSwitch(Mode::Direct, L"VLESS 已关闭，当前为直连模式。"); return 0; }
+    BlockTraffic(w == 4 ? L"核心停止失败，联网已阻断。请退出后重试。" : L"VLESS 启动失败，联网已阻断。请重试，或关闭 VLESS 恢复直连。");
     return 0;
   }
   if (message == WM_CLOSE) {
     if (!closing && !browsers.empty()) { ShowWindow(hwnd, SW_HIDE); return 0; }
     if (busy) { Status(L"操作进行中，请等待完成后退出。"); return 0; }
-    closing = true; mode = Mode::Blocked; Buttons();
+    closing = true; ChangeMode(Mode::Blocked); Buttons();
     auto copy = browsers;
     for (const auto& browser : copy) browser->GetHost()->CloseBrowser(false);
     if (browsers.empty()) FinishClose();
@@ -550,52 +766,64 @@ void CreatePanel() {
   wc.lpszClassName = L"TunnelBrowserControl"; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
   wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1); RegisterClassW(&wc);
   panel = CreateWindowW(wc.lpszClassName, L"Tunnel Browser · 代理与环境设置", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-    CW_USEDEFAULT, CW_USEDEFAULT, 660, 610, nullptr, nullptr, wc.hInstance, nullptr);
+    CW_USEDEFAULT, CW_USEDEFAULT, 620, 460, nullptr, nullptr, wc.hInstance, nullptr);
+  if (!panel) { policy_error = L"无法创建设置窗口。"; StartupError(); return; }
   auto add = [&](const wchar_t* kind, const wchar_t* text, DWORD style, int x, int y, int width, int height, int id = 0) {
     auto control = CreateWindowExW(kind == std::wstring(L"EDIT") ? WS_EX_CLIENTEDGE : 0, kind, text,
       WS_CHILD | WS_VISIBLE | style, x, y, width, height, panel, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), wc.hInstance, nullptr);
-    SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+    panel_controls.emplace_back(control, CefRect(x, y, width, height));
     if (style & WS_TABSTOP) SetWindowSubclass(control, ControlKeys, 1, 0);
     return control;
   };
-  status_label = add(L"STATIC", L"直连模式 · VLESS 未启用", 0, 18, 16, 608, 44);
-  add(L"STATIC", L"VLESS 节点链接（RAW/TCP + REALITY + Vision）", 0, 18, 78, 608, 24);
-  link_edit = add(L"EDIT", L"", WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL, 18, 104, 608, 78);
+  status_label = add(L"STATIC", L"直连模式 · VLESS 未启用", 0, 18, 16, 568, 44);
+  add(L"STATIC", L"VLESS 节点链接（RAW/TCP + REALITY + Vision）", 0, 18, 78, 568, 24);
+  link_edit = add(L"EDIT", L"", WS_TABSTOP | ES_PASSWORD | ES_AUTOHSCROLL, 18, 104, 568, 28);
   SendMessageW(link_edit, EM_SETLIMITTEXT, 8192, 0);
-  auto saved = LoadLink(); SetWindowTextW(link_edit, Wide(saved).c_str());
-  connect_button = add(L"BUTTON", L"启用 VLESS", WS_TABSTOP | BS_DEFPUSHBUTTON, 18, 196, 190, 34, 101);
-  disconnect_button = add(L"BUTTON", L"关闭 VLESS · 直连", WS_TABSTOP, 226, 196, 190, 34, 103);
-  open_button = add(L"BUTTON", L"新建浏览器窗口", WS_TABSTOP, 434, 196, 192, 34, 102);
-  add(L"STATIC", L"当前 profile 的环境参数", 0, 18, 252, 608, 24);
-  add(L"STATIC", L"语言", 0, 18, 288, 100, 22);
-  language_edit = add(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 136, 280, 490, 220);
+  SendMessageW(link_edit, EM_SETCUEBANNER, FALSE, reinterpret_cast<LPARAM>(L"粘贴链接，留空使用已保存的节点"));
+  connect_button = add(L"BUTTON", L"启用 VLESS", WS_TABSTOP | BS_DEFPUSHBUTTON, 18, 148, 277, 34, 101);
+  disconnect_button = add(L"BUTTON", L"关闭 VLESS · 直连", WS_TABSTOP, 309, 148, 277, 34, 103);
+  add(L"STATIC", L"语言", 0, 18, 205, 100, 22);
+  language_edit = add(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 136, 200, 450, 220);
   if (std::find(languages.begin(), languages.end(), profile.languages) == languages.end()) languages.push_back(profile.languages);
   for (const auto& item : languages) SendMessageW(language_edit, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(Wide(item).c_str()));
   auto language = std::find(languages.begin(), languages.end(), profile.languages);
   SendMessageW(language_edit, CB_SETCURSEL, std::distance(languages.begin(), language), 0);
-  add(L"STATIC", L"时区", 0, 18, 328, 100, 22);
-  timezone_edit = add(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 136, 320, 490, 220);
+  add(L"STATIC", L"时区", 0, 18, 245, 100, 22);
+  timezone_edit = add(L"COMBOBOX", L"", WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 136, 240, 450, 220);
   if (std::find(timezones.begin(), timezones.end(), profile.timezone) == timezones.end()) timezones.push_back(profile.timezone);
   for (const auto& item : timezones) SendMessageW(timezone_edit, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(Wide(item).c_str()));
   auto timezone = std::find(timezones.begin(), timezones.end(), profile.timezone);
   SendMessageW(timezone_edit, CB_SETCURSEL, std::distance(timezones.begin(), timezone), 0);
-  add(L"STATIC", L"报告屏幕尺寸", 0, 18, 368, 112, 22);
-  width_edit = add(L"EDIT", std::to_wstring(profile.screen_width).c_str(), WS_TABSTOP | ES_NUMBER, 136, 360, 130, 28);
-  add(L"STATIC", L"×", 0, 280, 368, 20, 22);
-  height_edit = add(L"EDIT", std::to_wstring(profile.screen_height).c_str(), WS_TABSTOP | ES_NUMBER, 312, 360, 130, 28);
-  add(L"BUTTON", L"保存环境参数（重启生效）", WS_TABSTOP, 18, 408, 295, 34, 104);
-  add(L"BUTTON", L"清空当前 profile…", WS_TABSTOP, 331, 408, 295, 34, 105);
-  add(L"STATIC", L"所有标签页共享一个 profile。环境参数会持续保存，清空 profile 时重置。\n浏览器菜单“设置”或网页右键菜单可再次打开此窗口。", 0, 18, 458, 608, 46);
-  add(L"STATIC", L"新窗口网址", 0, 18, 524, 110, 22);
-  home_edit = add(L"EDIT", L"https://example.com", WS_TABSTOP | ES_AUTOHSCROLL, 136, 516, 490, 28);
+  add(L"STATIC", L"报告屏幕尺寸", 0, 18, 285, 112, 22);
+  width_edit = add(L"EDIT", std::to_wstring(profile.screen_width).c_str(), WS_TABSTOP | ES_NUMBER, 136, 280, 130, 28);
+  add(L"STATIC", L"×", 0, 280, 285, 20, 22);
+  height_edit = add(L"EDIT", std::to_wstring(profile.screen_height).c_str(), WS_TABSTOP | ES_NUMBER, 312, 280, 130, 28);
+  add(L"BUTTON", L"保存环境参数（重启生效）", WS_TABSTOP, 18, 336, 277, 34, 104);
+  add(L"BUTTON", L"清空当前 profile…", WS_TABSTOP, 309, 336, 277, 34, 105);
+  auto dpi = GetDpiForWindow(panel);
+  SetWindowPos(panel, nullptr, 0, 0, MulDiv(620, dpi, 96), MulDiv(435, dpi, 96), SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOZORDER);
+  LayoutPanel(dpi);
   Buttons(); UpdateAppearance();
+#ifdef TB_TESTING
   if (smoke_stage) {
     SetWindowTextW(link_edit, Wide(smoke_link).c_str());
-    SetWindowTextW(home_edit, Wide(smoke_url).c_str());
     if (smoke_stage == 1) PostMessageW(panel, WM_COMMAND, 101, 0);
-    else OpenBrowser();
+    else OpenBrowser(smoke_url);
     CefPostDelayedTask(TID_UI, base::BindOnce([] { SmokeDone(false); }), 30000);
-  } else OpenBrowser();
+    return;
+  }
+#endif
+  OpenBrowser(startup_url);
+}
+
+std::string BrowserArgument(CefRefPtr<CefCommandLine> command) {
+  CefCommandLine::ArgumentList args;
+  command->GetArguments(args);
+  for (const auto& arg : args) {
+    auto url = arg.ToString();
+    if (url.starts_with("https://") || url.starts_with("http://")) return url;
+  }
+  return "about:blank";
 }
 
 class App : public CefApp, public CefBrowserProcessHandler {
@@ -605,24 +833,57 @@ class App : public CefApp, public CefBrowserProcessHandler {
   CefRefPtr<CefRequestContextHandler> GetDefaultRequestContextHandler() override { return new Traffic(); }
   void OnBeforeCommandLineProcessing(const CefString& process, CefRefPtr<CefCommandLine> command) override {
     if (!process.empty()) return;
-    // Direct mode needs normal DNS; SOCKS5 resolves proxy-mode target names remotely.
-    if (!smoke_report.empty()) command->AppendSwitchWithValue("host-resolver-rules", "MAP * ~NOTFOUND, EXCLUDE 127.0.0.1");
-    command->AppendSwitch("disable-quic");
-    command->AppendSwitch("disable-background-networking");
-    command->AppendSwitch("disable-component-update");
-    command->AppendSwitch("disable-sync");
+    if (startup_url != "about:blank") command->AppendSwitchWithValue("tb-open-url", startup_url);
+    for (auto name : {"disable-background-networking", "disable-breakpad", "disable-component-update",
+                      "disable-component-extensions-with-background-pages", "disable-default-apps", "disable-domain-reliability",
+                      "disable-extensions", "disable-quic", "disable-search-engine-choice-screen", "disable-software-rasterizer",
+                      "disable-sync", "disable-updater-scheduler", "disable-webgpu", "metrics-recording-only", "no-first-run", "no-pings"})
+      command->AppendSwitch(name);
+    command->AppendSwitchWithValue("disable-features", "AutofillServerCommunication,BackForwardCache,"
+      "CertificateTransparencyComponentUpdater,LensOverlay,MediaRouter,NetworkTimeServiceQuerying,OptimizationHints,"
+      "OptimizationGuideModelDownloading,PasswordLeakDetection,PreconnectToSearch,Translate,TranslateRankerQuery,TranslateRankerEnforcement");
+    command->AppendSwitchWithValue("disable-blink-features", "PushMessaging,WebGPU");
+    for (auto name : {"gaia-url", "lso-url", "google-apis-url", "google-base-url", "google-url", "oauth-account-manager-url"})
+      command->AppendSwitchWithValue(name, "https://tunnelbrowser.invalid/");
+    // Chromium fixes the account-consistency mode at profile initialization.
+    command->AppendSwitchWithValue("allow-browser-signin", "false");
     command->AppendSwitchWithValue("force-webrtc-ip-handling-policy", "disable_non_proxied_udp");
+    std::string dns;
+    for (auto domain : kServiceDomains) {
+      if (!dns.empty()) dns += ", ";
+      dns += "MAP " + std::string(domain) + " ~NOTFOUND, MAP *." + std::string(domain) + " ~NOTFOUND";
+    }
+#ifdef TB_TESTING
+    if (!smoke_report.empty()) {
+      dns += ", MAP * ~NOTFOUND, EXCLUDE 127.0.0.1";
+      command->AppendSwitch("disable-popup-blocking");
+      command->AppendSwitchWithValue("log-net-log", (smoke_report.parent_path() / L"netlog.json").wstring());
+    }
+#endif
+    command->AppendSwitchWithValue("host-resolver-rules", dns);
   }
   void OnContextInitialized() override {
+    auto doh = CefValue::Create(); doh->SetString("off");
+    auto global = CefRequestContext::GetGlobalContext();
+    if (!SetPref(CefPreferenceManager::GetGlobalPreferenceManager(), "dns_over_https.mode", doh) ||
+        !ProxyPolicy(global, Mode::Blocked) || !ConfigureProfile(global)) { StartupError(); return; }
     CefRequestContextSettings settings;
     CefString(&settings.cache_path) = (data_dir / L"profile").wstring();
     CefString(&settings.accept_language_list) = profile.languages;
     context = CefRequestContext::CreateContext(settings, new Traffic());
+    if (!context) { policy_error = L"无法创建浏览器 profile。"; StartupError(); }
+  }
+  bool OnAlreadyRunningAppRelaunch(CefRefPtr<CefCommandLine> command, const CefString&) override {
+    auto url = command->GetSwitchValue("tb-open-url").ToString();
+    if (CanBrowse() && panel && !closing) OpenBrowser(url.empty() ? "about:blank" : url);
+    else if (panel && !closing) ShowSettings();
+    return true;
   }
  private:
   IMPLEMENT_REFCOUNTING(App);
 };
 
+#ifdef TB_TESTING
 int SelfTest() {
   int checks = 0;
   auto check = [&](bool ok, const char* name) { ++checks; if (!ok) { std::cerr << "FAIL: " << name << std::endl; } return ok; };
@@ -637,10 +898,14 @@ int SelfTest() {
   auto ipv6 = link; ipv6.replace(ipv6.find("127.0.0.1"), 9, "[::1]");
   auto parsed6 = ParseNode(ipv6, error);
   if (!check(parsed6 && parsed6->host == "::1", "IPv6 share URL")) return 1;
+  if (!check(ParseNode(link + "&spx=%2Fdocs%3Fid%3D1", error).has_value() &&
+      !ParseNode(link + "&spx=https%3A%2F%2Fexample.com", error), "spider path stays within the node origin")) return 1;
+  if (!check(ServiceDomain("update.googleapis.com.") && ServiceDomain("clients2.google.com") &&
+      !ServiceDomain("non-googleapis.com") && !ServiceDomain("www.google.com"), "service domain boundaries")) return 1;
   std::string encrypted, decrypted;
   if (!check(Protect(link, encrypted, false) && encrypted != link && Protect(encrypted, decrypted, true) && decrypted == link, "DPAPI round trip")) return 1;
   auto version = core.Call("xrayVersion");
-  if (!check(version && version->GetBool("success") && version->GetDictionary("data")->GetString("version") == "26.10.31", "pinned C ABI")) return 1;
+  if (!check(version && version->GetBool("success") && version->GetDictionary("data")->GetString("version") == XRAY_VERSION, "pinned C ABI")) return 1;
   int port = FreePort();
   auto config = MakeConfig(*node, port);
   if (!check(port > 0 && core.Start(config), "start generated REALITY config")) return 1;
@@ -665,29 +930,44 @@ int SelfTest() {
   if (!check(!SaveProfile(temp, invalid) && LoadProfile(temp, loaded) && loaded.screen_width == 1600, "invalid settings preserve previous profile")) return 1;
   std::filesystem::create_directory(temp / L"profile", fs_error);
   { std::ofstream cookie(temp / L"profile" / L"Cookies"); cookie << "test"; }
+  std::filesystem::create_directory(temp / L"Default", fs_error);
+  { std::ofstream history(temp / L"Default" / L"History"); history << "test"; }
   { std::ofstream node_file(temp / L"node.dat"); node_file << "test encrypted node"; }
-  if (!check(ResetProfileData(temp) && !std::filesystem::exists(temp / L"profile") && std::filesystem::exists(temp / L"node.dat"), "reset clears only browsing profile and preserves node")) return 1;
+  if (!check(ResetProfileData(temp) && !std::filesystem::exists(temp / L"profile") && !std::filesystem::exists(temp / L"Default") &&
+      std::filesystem::exists(temp / L"node.dat"), "reset clears both CEF directories and preserves node")) return 1;
   if (!check(LoadProfile(temp, loaded) && loaded.id != original.id, "explicit reset creates a new profile")) return 1;
   std::filesystem::remove(temp / L"node.dat", fs_error); ResetProfileData(temp); std::filesystem::remove(temp, fs_error);
   if (!check(mode == Mode::Direct && CanBrowse() && !ProxyEnabled(), "default direct browsing")) return 1;
   std::cout << "PASS: " << checks << " checks; no remote node contacted" << std::endl;
   return 0;
 }
+#endif
 
 int Run(HINSTANCE instance, void* sandbox) {
   CefMainArgs args(instance);
   int child = CefExecuteProcess(args, nullptr, sandbox);
   if (child >= 0) return child;
-  wchar_t module[MAX_PATH]{}; GetModuleFileNameW(nullptr, module, MAX_PATH); app_dir = std::filesystem::path(module).parent_path();
+  std::wstring module(512, L'\0');
+  for (;;) {
+    auto size = GetModuleFileNameW(nullptr, module.data(), static_cast<DWORD>(module.size()));
+    if (!size) return 1;
+    if (size < module.size()) { module.resize(size); break; }
+    module.resize(module.size() * 2);
+  }
+  app_dir = std::filesystem::path(module).parent_path();
   WSADATA winsock{}; if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return 1;
   auto command = CefCommandLine::CreateCommandLine(); command->InitFromString(GetCommandLineW());
+#ifdef TB_TESTING
   if (command->HasSwitch("self-test")) { int result = SelfTest(); WSACleanup(); return result; }
+#endif
   if (!sandbox || command->HasSwitch("no-sandbox") || command->HasSwitch("single-process") ||
       command->HasSwitch("proxy-server") || command->HasSwitch("no-proxy-server") || command->HasSwitch("proxy-pac-url") ||
       command->HasSwitch("proxy-auto-detect") || command->HasSwitch("ignore-certificate-errors") ||
       command->HasSwitch("disable-web-security") || command->HasSwitch("remote-debugging-port")) {
     MessageBoxW(nullptr, L"启动参数不符合浏览器的安全策略。请直接运行 TunnelBrowser.exe。", L"Tunnel Browser", MB_ICONERROR); return 1;
   }
+  startup_url = BrowserArgument(command);
+#ifdef TB_TESTING
   if (command->HasSwitch("smoke-test")) {
     auto fixture = std::filesystem::path(command->GetSwitchValue("smoke-test").ToWString());
     std::ifstream file(fixture, std::ios::binary);
@@ -702,35 +982,59 @@ int Run(HINSTANCE instance, void* sandbox) {
     smoke_scenario = dict->GetString("scenario");
     if (smoke_scenario.empty()) smoke_scenario = "proxy";
     smoke_stage = smoke_scenario == "direct" ? 4 : 1;
-  } else {
+  } else
+#endif
+  {
     PWSTR local = nullptr;
     if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &local))) return 1;
     data_dir = std::filesystem::path(local) / L"TunnelBrowser"; CoTaskMemFree(local);
   }
   std::error_code error; std::filesystem::create_directories(data_dir, error);
-  if (error || !(proxy_port = FreePort())) return 1;
+  if (error) return 1;
   if (!LoadProfile(data_dir, profile)) {
-    if (smoke_report.empty()) MessageBoxW(nullptr, L"当前 profile 的环境参数无法读取，原文件已保留。请检查 fingerprint.json。", L"Tunnel Browser", MB_ICONERROR);
+#ifdef TB_TESTING
+    if (smoke_report.empty())
+#endif
+      MessageBoxW(nullptr, L"当前 profile 的环境参数无法读取。请检查 fingerprint.json 和目录权限。", L"Tunnel Browser", MB_ICONERROR);
     return 1;
   }
   CefSettings settings;
   CefString(&settings.root_cache_path) = data_dir.wstring();
-  CefString(&settings.cache_path) = (data_dir / L"global").wstring();
+  CefString(&settings.cache_path) = data_dir.wstring();
   settings.log_severity = LOGSEVERITY_DISABLE;
-  CefString(&settings.locale) = "zh-CN";
+#ifdef TB_TESTING
+  if (!smoke_report.empty()) {
+    settings.log_severity = LOGSEVERITY_WARNING;
+    CefString(&settings.log_file) = (smoke_report.parent_path() / L"cef.log").wstring();
+  }
+#endif
+  settings.command_line_args_disabled = true;
+  auto locale = profile.languages.substr(0, profile.languages.find(','));
+  for (auto code : {"de", "fr", "ja"}) if (locale.starts_with(std::string(code) + "-")) locale = code;
+  if (!std::filesystem::exists(app_dir / L"locales" / (Wide(locale) + L".pak"))) locale = "en-US";
+  CefString(&settings.locale) = locale;
   CefString(&settings.accept_language_list) = profile.languages;
+  SetEnvironmentVariableW(L"GOOGLE_API_KEY", L"no");
+  SetEnvironmentVariableW(L"GOOGLE_DEFAULT_CLIENT_ID", L"no");
+  SetEnvironmentVariableW(L"GOOGLE_DEFAULT_CLIENT_SECRET", L"no");
   auto app = CefRefPtr<App>(new App());
   if (!CefInitialize(args, settings, app, sandbox)) return CefGetExitCode();
   CefRunMessageLoop();
   if (worker.joinable()) worker.join();
   context = nullptr; request_contexts.clear(); app = nullptr;
   CefShutdown();
+  if (blocked_socket != INVALID_SOCKET) closesocket(blocked_socket);
   if (state_brush) { DeleteObject(state_brush); state_brush = nullptr; }
+  if (panel_font) DeleteObject(panel_font);
   if (reset_requested && !ResetProfileData(data_dir)) {
     MessageBoxW(nullptr, L"profile 未能完全清空，请确认所有浏览器进程已退出后再试。已保存节点没有删除。", L"Tunnel Browser", MB_ICONERROR);
     WSACleanup(); return 1;
   }
-  WSACleanup(); return smoke_report.empty() ? 0 : smoke_result;
+  WSACleanup();
+#ifdef TB_TESTING
+  if (!smoke_report.empty()) return smoke_result;
+#endif
+  return startup_failed ? 1 : 0;
 }
 }
 

@@ -37,8 +37,9 @@ bool LoadProfile(const std::filesystem::path& root, Profile& p) {
     GUID id{}; wchar_t text[40]{};
     if (FAILED(CoCreateGuid(&id)) || !StringFromGUID2(id, text, 40)) return false;
     p.id = CefString(text).ToString();
-    p.screen_width = std::max(800, GetSystemMetrics(SM_CXSCREEN));
-    p.screen_height = std::max(600, GetSystemMetrics(SM_CYSCREEN));
+    auto dpi = GetDpiForSystem();
+    p.screen_width = std::clamp(MulDiv(GetSystemMetrics(SM_CXSCREEN), 96, dpi), 800, 7680);
+    p.screen_height = std::clamp(MulDiv(GetSystemMetrics(SM_CYSCREEN), 96, dpi), 600, 4320);
     return SaveProfile(root, p);
   }
   auto size = std::filesystem::file_size(path, error);
@@ -58,11 +59,12 @@ bool ResetProfileData(const std::filesystem::path& root) {
   auto base = std::filesystem::canonical(root, error);
   if (error || base == base.root_path()) return false;
   // Only these app-owned children may be cleared; refuse junctions escaping root.
-  for (const auto* name : {L"profile", L"global", L"fingerprint.json", L"fingerprint.json.tmp", L"Local State"}) {
+  const wchar_t* names[] = {L"profile", L"Default", L"global", L"fingerprint.json", L"fingerprint.json.tmp", L"Local State"};
+  for (const auto* name : names) {
     auto target = std::filesystem::weakly_canonical(base / name, error);
     if (error || target.parent_path() != base) return false;
   }
-  for (const auto* name : {L"profile", L"global", L"fingerprint.json", L"fingerprint.json.tmp", L"Local State"}) {
+  for (const auto* name : names) {
     std::filesystem::remove_all(base / name, error);
     if (error) return false;
   }
