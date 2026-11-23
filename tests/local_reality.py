@@ -60,10 +60,13 @@ def run():
         reports = []
         accept_languages = []
         paths = []
+        switch_sources = []
 
         def do_GET(self):
             Site.requests += 1
             Site.paths.append(self.path)
+            if self.path == "/?switch":
+                Site.switch_sources.append(self.client_address[0])
             Site.accept_languages.append(self.headers.get("Accept-Language", ""))
             if self.path in ("/favicon.ico", "/?blocked", "/?offline-check"):
                 self.send_response(204)
@@ -140,18 +143,28 @@ def run():
     public = encode(private.public_key().public_bytes_raw())
     node_port = free_port()
     uuid = "00112233-4455-6677-8899-aabbccddeeff"
+    second_uuid = "00112233-4455-6677-8899-aabbccddee00"
+    # Give each fixture node a distinct source IP so the HTTP server detects any direct reload.
+    nodes = [(uuid, "first", "127.0.0.2"), (second_uuid, "second", "127.0.0.3")]
     config = {"log": {"loglevel": "debug", "error": str(folder / "server-debug.log"), "access": str(folder / "server-access.log")}, "inbounds": [{"listen": "127.0.0.1", "port": node_port,
-        "protocol": "vless", "settings": {"clients": [{"id": uuid, "flow": "xtls-rprx-vision"}], "decryption": "none"},
+        "protocol": "vless", "settings": {
+            "clients": [{"id": node_id, "email": tag, "flow": "xtls-rprx-vision"} for node_id, tag, _ in nodes],
+            "decryption": "none"},
         "streamSettings": {"network": "raw", "security": "reality", "realitySettings": {
             "target": f"127.0.0.1:{camouflage.server_port}", "serverNames": ["localhost"],
             "privateKey": encode(private.private_bytes_raw()), "shortIds": ["ab12"]}}}],
-        "outbounds": [{"protocol": "blackhole", "tag": "block"}, {"protocol": "freedom", "tag": "fixture", "settings": {
-            "finalRules": [{"action": "allow", "network": "tcp", "ip": ["127.0.0.1/32"], "port": str(site.server_port)}]}}],
-        "routing": {"rules": [{"type": "field", "ip": ["127.0.0.1/32"], "port": str(site.server_port), "outboundTag": "fixture"}]}}
+        "outbounds": [{"protocol": "blackhole", "tag": "block"}] + [
+            {"protocol": "freedom", "tag": tag, "sendThrough": source, "settings": {
+                "finalRules": [{"action": "allow", "network": "tcp", "ip": ["127.0.0.1/32"], "port": str(site.server_port)}]}}
+            for _, tag, source in nodes],
+        "routing": {"rules": [
+            {"type": "field", "user": [tag], "ip": ["127.0.0.1/32"], "port": str(site.server_port), "outboundTag": tag}
+            for _, tag, _ in nodes]}}
     result = invoke("runXray", config)
     assert result["success"], result
     fixture = {"link": f"vless://{uuid}@127.0.0.1:{node_port}?type=tcp&security=reality&flow=xtls-rprx-vision&sni=localhost&pbk={public}&sid=ab12&fp=chrome",
                "url": f"http://127.0.0.1:{site.server_port}/"}
+    fixture["switchLink"] = fixture["link"].replace(uuid, second_uuid).replace("type=tcp&", "")
     path = folder / "fixture.json"
     profile_dir = folder / "browser-data"
     profile_dir.mkdir()
@@ -160,7 +173,7 @@ def run():
     (profile_dir / "fingerprint.json").write_text(json.dumps(expected), encoding="utf-8")
     process = None
     try:
-        for scenario in ("proxy", "direct", "direct"):
+        for scenario in ("proxy", "switch", "direct", "direct"):
             fixture["scenario"] = scenario
             path.write_text(json.dumps(fixture), encoding="utf-8")
             report_path = folder / "result.json"
@@ -169,12 +182,13 @@ def run():
             status = process.wait(timeout=60)
             report = json.loads(report_path.read_text()) if report_path.exists() else {}
             assert status == 0 and report.get("success"), (status, report, str(folder))
-            assert report["yellow"] and (scenario != "proxy" or report["green"]), report
+            assert report["yellow"] and (scenario == "direct" or report["green"]), report
             check_browser_network(folder)
             if scenario == "direct":
                 assert report["tabs"] >= 4, report
             assert json.loads((profile_dir / "fingerprint.json").read_text()) == expected
             print("PASS:", scenario, report, flush=True)
+        assert Site.switch_sources == ["127.0.0.2", "127.0.0.3"], Site.switch_sources
         assert Site.requests > 0, "Fixture never received a web request"
         assert not ({"/?blocked", "/?offline-check"} & set(Site.paths)), Site.paths
         assert {"/?tab2", "/?popup-get", "/?popup-post", "/?direct-after-disable"} <= set(Site.paths), Site.paths
@@ -198,7 +212,8 @@ def run():
             assert report["validationMessage"] == "Please fill out this field.", report
         assert all(value.startswith("en-US") for value in Site.accept_languages), Site.accept_languages
         (folder / "environments.json").write_text(json.dumps(Site.reports, indent=2), encoding="utf-8")
-        print("PASS: fail-closed, explicit restore, native tabs, GET/POST popups, locale, cookies and browser-service network checks")
+        print("PASS: VLESS node switch without direct reload, fail-closed, explicit restore, native tabs, "
+              "GET/POST popups, locale, cookies and browser-service network checks")
         print("Test artifacts:", folder)
     finally:
         (folder / "environments.json").write_text(json.dumps(Site.reports, indent=2), encoding="utf-8")

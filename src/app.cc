@@ -62,7 +62,8 @@ int smoke_stage = 0, smoke_result = 1;
 int smoke_first_browser = 0;
 bool smoke_green = false, smoke_yellow = false;
 std::string smoke_scenario = "proxy";
-std::string smoke_link, smoke_url;
+std::string smoke_link, smoke_switch_link, smoke_url;
+constexpr int kSmokeOpenSwitchPage = 10, kSmokeWaitForSwitch = 11;
 std::filesystem::path smoke_report;
 void SmokeStep(const char* step) {
   if (!smoke_report.empty()) std::ofstream(smoke_report.parent_path() / L"steps.txt", std::ios::app) << step << '\n';
@@ -373,10 +374,23 @@ class BrowserClient : public CefClient, public CefLifeSpanHandler, public CefCon
     if (smoke_stage == 1) {
       smoke_green = ProxyEnabled() && context->GetChromeColorSchemeColor() == ModeColor();
       if (!smoke_green) { SmokeDone(false); return; }
+      if (smoke_scenario == "switch") {
+        smoke_stage = kSmokeOpenSwitchPage;
+        OpenBrowser(smoke_url + "?switch");
+        return;
+      }
       smoke_stage = 2;
       if (!core.Stop()) { SmokeDone(false); return; }
       // Keep proxy mode selected to test proxy failure rather than the guard.
       context->CloseAllConnections(new OfflineProbe(browser));
+    } else if (smoke_stage == kSmokeOpenSwitchPage && browser->GetMainFrame()->GetURL() == smoke_url + "?switch") {
+      if (!IsWindowEnabled(connect_button) || !IsWindowEnabled(link_edit) ||
+          Text(connect_button) != L"切换 VLESS 节点") { SmokeDone(false); return; }
+      smoke_stage = kSmokeWaitForSwitch;
+      SetWindowTextW(link_edit, Wide(smoke_switch_link).c_str());
+      PostMessageW(panel, WM_COMMAND, 101, 0);
+    } else if (smoke_stage == kSmokeWaitForSwitch && browser->GetMainFrame()->GetURL() == smoke_url + "?switch") {
+      SmokeDone(smoke_yellow && ProxyEnabled() && browsers.front()->GetMainFrame()->GetURL() == "chrome://history/");
     } else if (smoke_stage == 2) SmokeDone(false);
     else if (smoke_stage == 4) {
       smoke_yellow = mode == Mode::Direct && context->GetChromeColorSchemeColor() == ModeColor();
@@ -530,6 +544,13 @@ void UnloadPages() {
     int id = browser->GetIdentifier();
     paused_pages.try_emplace(id, url);
     unloading.Track(id);
+#ifdef TB_TESTING
+    // Simulate the first tab navigating to an internal page before its unload completes.
+    if (smoke_stage == kSmokeWaitForSwitch && browser->IsSame(browsers.front())) {
+      frame->LoadURL("chrome://history/");
+      continue;
+    }
+#endif
     frame->LoadURL("about:blank");
   }
 }
@@ -547,12 +568,14 @@ void BlockTraffic(const std::wstring& reason) {
 #ifdef TB_TESTING
   if (smoke_stage == 2 && !browsers.empty()) {
     smoke_stage = 7;
+    ShowWindow(panel, SW_HIDE);
     auto probe = browsers.front();
     CefPostDelayedTask(TID_UI, base::BindOnce([](CefRefPtr<CefBrowser> tab) {
       if (tab->IsValid()) tab->GetMainFrame()->LoadURL(smoke_url + "?blocked");
     }, probe), 200);
     CefPostDelayedTask(TID_UI, base::BindOnce([] {
       if (smoke_stage != 7 || mode != Mode::Blocked) return;
+      if (!IsWindowVisible(panel)) { SmokeDone(false); return; }
       smoke_stage = 6;
       Disconnect();
     }), 1000);
@@ -812,6 +835,8 @@ void CreatePanel() {
 #ifdef TB_TESTING
   if (smoke_stage) {
     SetWindowTextW(link_edit, Wide(smoke_link).c_str());
+    if (smoke_scenario == "switch")
+      smoke_yellow = mode == Mode::Direct && context->GetChromeColorSchemeColor() == ModeColor();
     if (smoke_stage == 1) PostMessageW(panel, WM_COMMAND, 101, 0);
     else OpenBrowser(smoke_url);
     CefPostDelayedTask(TID_UI, base::BindOnce([] { SmokeDone(false); }), 30000);
@@ -991,6 +1016,7 @@ int Run(HINSTANCE instance, void* sandbox) {
     if (!json || json->GetType() != VTYPE_DICTIONARY) return 1;
     auto dict = json->GetDictionary();
     smoke_link = dict->GetString("link"); smoke_url = dict->GetString("url");
+    smoke_switch_link = dict->GetString("switchLink");
     if (!smoke_url.starts_with("http://127.0.0.1:")) return 1;
     smoke_report = fixture.parent_path() / L"result.json";
     data_dir = fixture.parent_path() / L"browser-data";
