@@ -57,6 +57,7 @@ std::map<int, std::string> paused_pages;
 PageUnloads unloading;
 std::optional<Mode> switch_target;
 std::wstring switch_status;
+std::string pending_node_link;
 #ifdef TB_TESTING
 int smoke_stage = 0, smoke_result = 1;
 int smoke_first_browser = 0;
@@ -64,6 +65,7 @@ bool smoke_green = false, smoke_yellow = false;
 std::string smoke_scenario = "proxy";
 std::string smoke_link, smoke_switch_link, smoke_url;
 constexpr int kSmokeOpenSwitchPage = 10, kSmokeWaitForSwitch = 11;
+constexpr int kSmokeRejectSwitch = 12, kSmokeRecoverSaved = 13;
 std::filesystem::path smoke_report;
 void SmokeStep(const char* step) {
   if (!smoke_report.empty()) std::ofstream(smoke_report.parent_path() / L"steps.txt", std::ios::app) << step << '\n';
@@ -390,7 +392,17 @@ class BrowserClient : public CefClient, public CefLifeSpanHandler, public CefCon
       SetWindowTextW(link_edit, Wide(smoke_switch_link).c_str());
       PostMessageW(panel, WM_COMMAND, 101, 0);
     } else if (smoke_stage == kSmokeWaitForSwitch && browser->GetMainFrame()->GetURL() == smoke_url + "?switch") {
-      SmokeDone(smoke_yellow && ProxyEnabled() && browsers.front()->GetMainFrame()->GetURL() == "chrome://history/");
+      if (!smoke_yellow || !ProxyEnabled() || browsers.front()->GetMainFrame()->GetURL() != "chrome://history/" ||
+          LoadLink() != smoke_switch_link || Text(status_label) != L"已切换 VLESS 节点。") {
+        SmokeDone(false);
+        return;
+      }
+      smoke_stage = kSmokeRejectSwitch;
+      SetWindowTextW(link_edit, Wide(smoke_link).c_str());
+      PostMessageW(panel, WM_COMMAND, 101, 0);
+    } else if (smoke_stage == kSmokeRecoverSaved && ProxyEnabled() &&
+               browser->GetMainFrame()->GetURL() == smoke_url + "?switch") {
+      SmokeDone(LoadLink() == smoke_switch_link && Text(link_edit).empty());
     } else if (smoke_stage == 2) SmokeDone(false);
     else if (smoke_stage == 4) {
       smoke_yellow = mode == Mode::Direct && context->GetChromeColorSchemeColor() == ModeColor();
@@ -545,6 +557,8 @@ void UnloadPages() {
     paused_pages.try_emplace(id, url);
     unloading.Track(id);
 #ifdef TB_TESTING
+    // Hold one web page to exercise the real switch timeout after the core starts.
+    if (smoke_stage == kSmokeRejectSwitch && mode == Mode::Switching) continue;
     // Simulate the first tab navigating to an internal page before its unload completes.
     if (smoke_stage == kSmokeWaitForSwitch && browser->IsSame(browsers.front())) {
       frame->LoadURL("chrome://history/");
@@ -559,6 +573,7 @@ void BlockTraffic(const std::wstring& reason) {
   ChangeMode(Mode::Blocked);
   busy = false;
   switch_target.reset();
+  pending_node_link.clear();
   bool blocked = ApplyRoute(Mode::Blocked);
   DrainConnections();
   UnloadPages();
@@ -579,6 +594,14 @@ void BlockTraffic(const std::wstring& reason) {
       smoke_stage = 6;
       Disconnect();
     }), 1000);
+  } else if (smoke_stage == kSmokeRejectSwitch) {
+    const bool saved_node_preserved = LoadLink() == smoke_switch_link;
+    SmokeStep(saved_node_preserved ? "saved node preserved" : "saved node replaced before route switch");
+    if (!blocked || !reason.starts_with(L"关闭旧连接超时") || !saved_node_preserved ||
+        Text(link_edit) != Wide(smoke_link)) { SmokeDone(false); return; }
+    smoke_stage = kSmokeRecoverSaved;
+    SetWindowTextW(link_edit, L"");
+    PostMessageW(panel, WM_COMMAND, 101, 0);
   } else if (smoke_stage == 1) SmokeDone(false);
 #endif
 }
@@ -596,27 +619,28 @@ bool PauseTraffic(const wchar_t* message) {
 
 void BeginConnect() {
   if (!ConnectAllowed(mode, busy, closing)) return;
-  auto link = Utf8(Text(link_edit));
-  if (link.empty()) link = LoadLink();
+  auto input = Utf8(Text(link_edit));
   std::string error;
-  auto node = ParseNode(link, error);
+  auto node = ParseNode(input.empty() ? LoadLink() : input, error);
   if (!node) { Status(Wide(error)); return; }
-  // Switching from an active node goes through the blocked route; open pages never reload directly.
-  if (!PauseTraffic(ProxyEnabled() ? L"正在切换 VLESS 节点，当前网页将通过新线路重新打开……"
+  const bool switching_node = ProxyEnabled();
+  if (!PauseTraffic(switching_node ? L"正在切换 VLESS 节点，当前网页将通过新线路重新打开……"
                                    : L"正在启用 VLESS，当前网页将通过新线路重新打开……")) return;
-  worker = std::thread([link, node = std::move(*node)] {
+  switch_status = switching_node ? L"已切换 VLESS 节点。" : L"VLESS 已启用。";
+  pending_node_link = std::move(input);
+  worker = std::thread([node = std::move(*node)] {
     int port = core.Stop() ? FreePort() : 0;
     if (port && !core.Start(MakeConfig(node, port))) {
       // A failed start leaves the next attempt free to choose another port.
       port = 0;
     }
-    bool saved = port && SaveLink(link);
-    PostMessageW(panel, kComplete, port ? (saved ? 1 : 2) : 0, port);
+    PostMessageW(panel, kComplete, port ? 1 : 0, port);
   });
 }
 void Disconnect() {
   if (!DisconnectAllowed(mode, busy, closing)) return;
   if (!PauseTraffic(L"正在关闭 VLESS，当前网页将通过直连重新打开……")) return;
+  switch_status = L"VLESS 已关闭，当前为直连模式。";
   worker = std::thread([] { bool ok = core.Stop(); PostMessageW(panel, kComplete, ok ? 3 : 4, 0); });
 }
 void ResumeTraffic() {
@@ -630,6 +654,12 @@ void ResumeTraffic() {
   for (const auto& c : request_contexts) {
     c->CloseAllConnections(new ConnectionClosed(base::BindOnce([](std::shared_ptr<size_t> pending, Mode next, unsigned generation) {
       if (--*pending || generation != route_generation) return;
+      // The core can start before the browser commits the route. Save only after both succeed.
+      if (next == Mode::Proxy && !closing && !pending_node_link.empty()) {
+        if (SaveLink(pending_node_link)) SetWindowTextW(link_edit, L"");
+        else switch_status += L" 节点未保存，退出后需重新输入。";
+      }
+      pending_node_link.clear();
       ChangeMode(next);
       busy = false;
       UpdateAppearance();
@@ -660,12 +690,11 @@ void PageClosed(int browser_id) {
   unloading.Closed(browser_id);
   ResumeTraffic();
 }
-void FinishSwitch(Mode next, const std::wstring& message) {
+void FinishSwitch(Mode next) {
 #ifdef TB_TESTING
   SmokeStep("apply route");
 #endif
   switch_target = next;
-  switch_status = message;
   ResumeTraffic();
   auto generation = route_generation.load();
   CefPostDelayedTask(TID_UI, base::BindOnce([](unsigned generation) {
@@ -769,12 +798,11 @@ LRESULT CALLBACK PanelProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
   }
   if (message == kComplete) {
     if (worker.joinable()) worker.join();
-    if (w == 1 || w == 2) {
+    if (w == 1) {
       proxy_port = static_cast<int>(l);
-      if (w == 1) SetWindowTextW(link_edit, L"");
-      FinishSwitch(Mode::Proxy, w == 1 ? L"VLESS 已启用。" : L"VLESS 已启用，但节点保存失败；退出后需重新导入。");
+      FinishSwitch(Mode::Proxy);
       return 0;
-    } else if (w == 3) { FinishSwitch(Mode::Direct, L"VLESS 已关闭，当前为直连模式。"); return 0; }
+    } else if (w == 3) { FinishSwitch(Mode::Direct); return 0; }
     BlockTraffic(w == 4 ? L"核心停止失败，联网已阻断。请退出后重试。" : L"VLESS 启动失败，联网已阻断。请重试，或关闭 VLESS 恢复直连。");
     return 0;
   }
@@ -839,7 +867,7 @@ void CreatePanel() {
       smoke_yellow = mode == Mode::Direct && context->GetChromeColorSchemeColor() == ModeColor();
     if (smoke_stage == 1) PostMessageW(panel, WM_COMMAND, 101, 0);
     else OpenBrowser(smoke_url);
-    CefPostDelayedTask(TID_UI, base::BindOnce([] { SmokeDone(false); }), 30000);
+    CefPostDelayedTask(TID_UI, base::BindOnce([] { SmokeDone(false); }), smoke_scenario == "switch" ? 45000 : 30000);
     return;
   }
 #endif

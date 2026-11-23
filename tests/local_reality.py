@@ -188,7 +188,7 @@ def run():
                 assert report["tabs"] >= 4, report
             assert json.loads((profile_dir / "fingerprint.json").read_text()) == expected
             print("PASS:", scenario, report, flush=True)
-        assert Site.switch_sources == ["127.0.0.2", "127.0.0.3"], Site.switch_sources
+        assert Site.switch_sources == ["127.0.0.2", "127.0.0.3", "127.0.0.3"], Site.switch_sources
         assert Site.requests > 0, "Fixture never received a web request"
         assert not ({"/?blocked", "/?offline-check"} & set(Site.paths)), Site.paths
         assert {"/?tab2", "/?popup-get", "/?popup-post", "/?direct-after-disable"} <= set(Site.paths), Site.paths
@@ -212,8 +212,8 @@ def run():
             assert report["validationMessage"] == "Please fill out this field.", report
         assert all(value.startswith("en-US") for value in Site.accept_languages), Site.accept_languages
         (folder / "environments.json").write_text(json.dumps(Site.reports, indent=2), encoding="utf-8")
-        print("PASS: VLESS node switch without direct reload, fail-closed, explicit restore, native tabs, "
-              "GET/POST popups, locale, cookies and browser-service network checks")
+        print("PASS: VLESS switch without direct reload, recovery with saved node after switch timeout, fail-closed, "
+              "explicit restore, native tabs, GET/POST popups, locale, cookies and browser-service network checks")
         print("Test artifacts:", folder)
     finally:
         (folder / "environments.json").write_text(json.dumps(Site.reports, indent=2), encoding="utf-8")

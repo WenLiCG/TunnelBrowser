@@ -45,7 +45,7 @@ class FailClosedSourceTest(unittest.TestCase):
     def test_only_explicit_disconnect_restores_direct(self):
         self.assertEqual(self.app.count("FinishSwitch(Mode::Direct"), 1)
         handler = self.app[self.app.index("if (message == kComplete)"):self.app.index("if (message == WM_CLOSE)")]
-        self.assertIn("FinishSwitch(Mode::Direct, L\"VLESS 已关闭，当前为直连模式。\")", handler)
+        self.assertIn("FinishSwitch(Mode::Direct)", handler)
         self.assertIn("w == 3", handler)
         self.assertIn("BlockTraffic(", handler)
         self.assertIn("VLESS 启动失败，联网已阻断", handler)
